@@ -7,13 +7,41 @@ name = "locomotive"
 version = "0.1.0"
 description = "CI/CD load testing runner and regression analyzer for Locust"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.9"
+authors = [
+  {name = "Daria Edigareva"},
+]
+keywords = ["locust", "load-testing", "ci", "performance", "regression"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Testing",
+  "Topic :: System :: Benchmark",
+]
 dependencies = [
   "PyYAML>=6.0",
+  "locust>=2.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/locomotive-lib/locomotive"
+Repository = "https://github.com/locomotive-lib/locomotive"
+Issues = "https://github.com/locomotive-lib/locomotive/issues"
 
 [project.scripts]
 loco = "locomotive.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]

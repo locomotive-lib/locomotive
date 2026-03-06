@@ -1,0 +1,74 @@
+{
+  "run_id": "run-pass",
+  "baseline_id": "baseline",
+  "evaluated_at": "2026-03-03T10:01:00+00:00",
+  "status": "PASS",
+  "summary": {
+    "PASS": 5,
+    "WARNING": 0,
+    "DEGRADATION": 0,
+    "SKIP": 0
+  },
+  "results": [
+    {
+      "metric": "p95_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 10,
+      "fail": 25,
+      "baseline": 95.0,
+      "current": 88.0,
+      "delta_percent": -7.368421052631578,
+      "status": "PASS",
+      "reason": null
+    },
+    {
+      "metric": "p99_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 15,
+      "fail": 30,
+      "baseline": 142.0,
+      "current": 131.0,
+      "delta_percent": -7.746478873239436,
+      "status": "PASS",
+      "reason": null
+    },
+    {
+      "metric": "avg_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 10,
+      "fail": 25,
+      "baseline": 42.3,
+      "current": 39.1,
+      "delta_percent": -7.56501182033096,
+      "status": "PASS",
+      "reason": null
+    },
+    {
+      "metric": "error_rate",
+      "mode": "absolute",
+      "direction": "increase",
+      "warn": 1.0,
+      "fail": 5.0,
+      "baseline": 0.8,
+      "current": 0.5,
+      "delta_percent": -37.50000000000001,
+      "status": "PASS",
+      "reason": null
+    },
+    {
+      "metric": "rps",
+      "mode": "relative",
+      "direction": "decrease",
+      "warn": 10,
+      "fail": 20,
+      "baseline": 145.2,
+      "current": 152.8,
+      "delta_percent": 5.234159779614341,
+      "status": "PASS",
+      "reason": null
+    }
+  ]
+}

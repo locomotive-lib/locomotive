@@ -1,0 +1,74 @@
+{
+  "run_id": "run-degrade",
+  "baseline_id": "baseline",
+  "evaluated_at": "2026-03-05T10:01:00+00:00",
+  "status": "DEGRADATION",
+  "summary": {
+    "PASS": 0,
+    "WARNING": 0,
+    "DEGRADATION": 5,
+    "SKIP": 0
+  },
+  "results": [
+    {
+      "metric": "p95_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 10,
+      "fail": 25,
+      "baseline": 95.0,
+      "current": 185.0,
+      "delta_percent": 94.73684210526315,
+      "status": "DEGRADATION",
+      "reason": null
+    },
+    {
+      "metric": "p99_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 15,
+      "fail": 30,
+      "baseline": 142.0,
+      "current": 412.0,
+      "delta_percent": 190.14084507042253,
+      "status": "DEGRADATION",
+      "reason": null
+    },
+    {
+      "metric": "avg_ms",
+      "mode": "relative",
+      "direction": "increase",
+      "warn": 10,
+      "fail": 25,
+      "baseline": 42.3,
+      "current": 78.4,
+      "delta_percent": 85.34278959810877,
+      "status": "DEGRADATION",
+      "reason": null
+    },
+    {
+      "metric": "error_rate",
+      "mode": "absolute",
+      "direction": "increase",
+      "warn": 1.0,
+      "fail": 5.0,
+      "baseline": 0.8,
+      "current": 6.3,
+      "delta_percent": 687.5,
+      "status": "DEGRADATION",
+      "reason": null
+    },
+    {
+      "metric": "rps",
+      "mode": "relative",
+      "direction": "decrease",
+      "warn": 10,
+      "fail": 20,
+      "baseline": 145.2,
+      "current": 98.5,
+      "delta_percent": -32.162534435261705,
+      "status": "DEGRADATION",
+      "reason": null
+    }
+  ]
+}

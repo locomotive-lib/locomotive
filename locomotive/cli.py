@@ -30,8 +30,9 @@ def _normalize_mode(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip().lower()
+    # Accept legacy mode names for backward compatibility
     if text in {"resilience", "acceptance"}:
-        return text
+        return "resilience"
     return ""
 
 
@@ -42,7 +43,7 @@ def _resolve_gate_config(analysis_cfg: Dict[str, Any]) -> tuple[str, Dict[str, A
     has_thresholds = isinstance(thresholds, dict) and bool(thresholds)
     if not mode and has_thresholds:
         mode = "resilience"
-    if mode == "resilience" and not has_thresholds:
+    if mode and not has_thresholds:
         mode = ""
     return mode, gate_cfg
 
@@ -119,10 +120,7 @@ def _build_run_id(args: argparse.Namespace, config: Dict[str, Any]) -> str:
 
 
 def _build_locust_config(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
-    # Support both "locust" and "load" section names
-    locust_cfg = _get_section(config, "locust")
-    if not locust_cfg:
-        locust_cfg = _get_section(config, "load")
+    locust_cfg = _get_section(config, "load")
     
     scenario_cfg = _get_section(config, "scenario")
     scenario_headers = scenario_cfg.get("headers") if isinstance(scenario_cfg.get("headers"), dict) else {}
@@ -235,7 +233,7 @@ def _report(
     endpoint_stats = load_endpoint_stats(raw_dir / "locust_stats.csv")
 
     cfg = resolve_report_config(report_cfg or {})
-    if title and cfg.title == "CI Load Test Report":
+    if title:
         cfg.title = title
 
     html = render_report(
@@ -250,12 +248,17 @@ def _report(
         history_runs=history_runs,
     )
 
+    # Always save report in the run directory
+    run_report = storage.report_path(run_id)
+    storage.save_text(run_report, html)
+
+    # Also save to custom output path if specified
     if output_path:
         output = Path(output_path)
-    else:
-        output = storage.report_path(run_id)
-    storage.save_text(output, html)
-    return str(output)
+        if output.resolve() != run_report.resolve():
+            storage.save_text(output, html)
+
+    return str(output_path or run_report)
 
 
 def _gate_status(gate_eval: Dict[str, Any]) -> str:
@@ -317,7 +320,8 @@ def cmd_run(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     _maybe_generate_locustfile(storage, run_id, locust_config, config)
     result = _run(storage, run_id, locust_config)
 
-    if args.set_baseline and result.get("returncode") == 0:
+    metrics_exist = storage.metrics_path(run_id).exists()
+    if args.set_baseline and metrics_exist:
         storage.set_baseline(run_id)
 
     return int(result.get("returncode") or 0)
@@ -494,18 +498,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # run command
     run_parser = subparsers.add_parser("run", help="Run locust and store metrics")
+    _add_storage_args(run_parser)
     _add_run_args(run_parser)
 
     # analyze command
     analyze_parser = subparsers.add_parser("analyze", help="Analyze metrics vs baseline")
+    _add_storage_args(analyze_parser)
     _add_analyze_args(analyze_parser)
 
     # report command
     report_parser = subparsers.add_parser("report", help="Generate HTML report")
+    _add_storage_args(report_parser)
     _add_report_args(report_parser)
 
     # ci command (all-in-one)
     ci_parser = subparsers.add_parser("ci", help="Run, analyze, and report (full CI pipeline)")
+    _add_storage_args(ci_parser)
     _add_run_args(ci_parser)
     _add_analyze_args(ci_parser)
     _add_report_args(ci_parser)
@@ -524,13 +532,16 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stop-timeout", help="Timeout for stopping users")
     parser.add_argument("--extra-arg", action="append", help="Extra arguments to pass to locust")
     parser.add_argument("--locust-cmd", help="Custom locust command")
-    parser.add_argument("--storage", help="Artifacts storage directory")
-    parser.add_argument("--run-id", help="Unique run identifier")
     parser.add_argument("--set-baseline", action="store_true", help="Set this run as baseline")
 
 
-def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
+def _add_storage_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--storage", help="Artifacts storage directory")
+    parser.add_argument("--run-id", help="Unique run identifier")
     parser.add_argument("--baseline", help="Baseline run ID to compare against")
+
+
+def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rules", help="Path to rules JSON file")
     parser.add_argument("--fail-on", choices=["WARNING", "DEGRADATION"], help="Exit code 1 threshold")
 
@@ -548,7 +559,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "init":
         return cmd_init(args)
     
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError:
+        print(f"Error: config file not found: {args.config}")
+        print(f"Run 'loco init' to create a default config.")
+        return 1
 
     if args.command == "run":
         return cmd_run(args, config)

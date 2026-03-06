@@ -1,0 +1,12 @@
+{
+  "avg_ms": 42.3,
+  "error_rate": 0.8,
+  "failures": 70,
+  "max_ms": 187.4,
+  "median_ms": 38.0,
+  "min_ms": 2.1,
+  "p95_ms": 95.0,
+  "p99_ms": 142.0,
+  "requests": 8712,
+  "rps": 145.2
+}

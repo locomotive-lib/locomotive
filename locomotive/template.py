@@ -324,23 +324,23 @@ jobs:
       #   run: docker-compose up -d
       
       - name: Run load test
-        run: loco ci --config {config_name}
+        run: loco --config {config_name} ci
         env:
           # Add your environment variables here
           # API_TOKEN: ${{{{ secrets.API_TOKEN }}}}
           DUMMY_SERVICE_URL: http://localhost:8000
-      
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: loadtest-results
           path: artifacts/
-      
+
       # Set baseline on main branch
       - name: Set baseline
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: loco ci --config {config_name} --set-baseline
+        run: loco --config {config_name} ci --set-baseline
 '''
     
     output_path.parent.mkdir(parents=True, exist_ok=True)

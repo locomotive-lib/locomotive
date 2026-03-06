@@ -1,4 +1,8 @@
 __pycache__
 .idea
 diploma_main.md
-.gitignore
+dist/
+build/
+*.egg-info
+.DS_Store
+.coverage

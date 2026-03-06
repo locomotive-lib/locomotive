@@ -145,8 +145,6 @@ def evaluate_gate(
     history_summary: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, Any]]:
     thresholds = _parse_thresholds(gate_cfg.get("thresholds"))
-    if not thresholds and mode == "acceptance":
-        thresholds = {"error_rate": {"fail": 0}}
     if not thresholds:
         return None
 

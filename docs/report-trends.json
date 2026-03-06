@@ -1,0 +1,29 @@
+{
+  "load": {
+    "host": "https://staging.myapp.com",
+    "users": 50,
+    "spawn_rate": 10,
+    "run_time": "60s"
+  },
+  "scenario": {
+    "requests": [
+      {"name": "List Users", "method": "GET", "path": "/api/users", "weight": 5},
+      {"name": "Create Order", "method": "POST", "path": "/api/orders", "weight": 3},
+      {"name": "Get Product", "method": "GET", "path": "/api/products/1", "weight": 4},
+      {"name": "Health Check", "method": "GET", "path": "/health", "weight": 1},
+      {"name": "Update Profile", "method": "PUT", "path": "/api/profile", "weight": 2}
+    ]
+  },
+  "artifacts": {"storage": "docs/artifacts", "history": 30},
+  "report": {
+    "title": "Performance Trends Report",
+    "theme": {
+      "mode": "light",
+      "color": "#8b5cf6"
+    },
+    "sections": ["kpi", "charts", "regression", "endpoints", "trends"],
+    "trends": {
+      "metrics": ["p95_ms", "rps", "error_rate"]
+    }
+  }
+}

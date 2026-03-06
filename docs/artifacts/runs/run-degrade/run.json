@@ -1,0 +1,24 @@
+{
+  "run_id": "run-degrade",
+  "host": "https://staging.myapp.com",
+  "users": 50,
+  "spawn_rate": 10,
+  "run_time": "60s",
+  "started_at": "2026-03-05T10:00:00+00:00",
+  "finished_at": "2026-03-05T10:01:00+00:00",
+  "returncode": 0,
+  "locustfile": "runs/run-degrade/generated/generated_locustfile.py",
+  "command": [
+    "locust",
+    "-f",
+    "generated_locustfile.py",
+    "--headless",
+    "--users=50",
+    "--spawn-rate=10",
+    "--run-time=60s",
+    "--host=https://staging.myapp.com"
+  ],
+  "meta": {
+    "ci": {}
+  }
+}

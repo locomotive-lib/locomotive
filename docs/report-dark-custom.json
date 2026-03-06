@@ -1,0 +1,79 @@
+{
+  "load": {
+    "host": "https://staging.myapp.com",
+    "users": 50,
+    "spawn_rate": 10,
+    "run_time": "60s"
+  },
+  "scenario": {
+    "requests": [
+      {"name": "List Users", "method": "GET", "path": "/api/users", "weight": 5},
+      {"name": "Create Order", "method": "POST", "path": "/api/orders", "weight": 3},
+      {"name": "Get Product", "method": "GET", "path": "/api/products/1", "weight": 4},
+      {"name": "Health Check", "method": "GET", "path": "/health", "weight": 1},
+      {"name": "Update Profile", "method": "PUT", "path": "/api/profile", "weight": 2}
+    ]
+  },
+  "artifacts": {"storage": "docs/artifacts", "history": 30},
+  "report": {
+    "title": "Neon Performance Dashboard",
+    "theme": {
+      "mode": "dark",
+      "colors": {
+        "primary": "#e040fb",
+        "primary-light": "#ea80fc",
+        "bg": "#0a0a1a",
+        "card": "#141428",
+        "text": "#e0e0ff",
+        "text-muted": "#7c7ca0",
+        "line": "#2a2a4a",
+        "pass-bg": "#1b5e20",
+        "warn-bg": "#e65100",
+        "fail-bg": "#b71c1c",
+        "skip-bg": "#1a1a3a"
+      }
+    },
+    "branding": {
+      "name": "CyberCorp",
+      "color": "#e040fb"
+    },
+    "kpi": {
+      "cards": [
+        {"metric": "rps", "label": "Throughput", "format": "{value:.1f}", "unit": "req/s"},
+        {"metric": "avg_ms", "label": "Avg Latency", "format": "{value:.0f}", "unit": "ms"},
+        {"metric": "p95_ms", "label": "P95", "format": "{value:.0f}", "unit": "ms"},
+        {"metric": "error_rate", "label": "Error Rate", "format": "{value:.2f}", "unit": "%"},
+        {"metric": "requests", "label": "Total", "format": "{value:,}"},
+        {"metric": "duration", "label": "Duration", "format": "duration"}
+      ]
+    },
+    "charts": {
+      "throughput": {
+        "title": "Traffic Flow",
+        "datasets": [
+          {"key": "rps", "label": "RPS", "color": "#e040fb", "y_axis": "left"},
+          {"key": "errors", "label": "Errors/s", "color": "#ff1744", "y_axis": "right", "dash": [5, 5]},
+          {"key": "users", "label": "Users", "color": "#448aff", "y_axis": "right", "fill": true}
+        ]
+      },
+      "response_time": {
+        "title": "Response Latency",
+        "datasets": [
+          {"key": "p50", "label": "Median", "color": "#69f0ae"},
+          {"key": "p95", "label": "P95", "color": "#e040fb"},
+          {"key": "p99", "label": "P99", "color": "#ff1744", "dash": [5, 5]}
+        ]
+      }
+    },
+    "endpoint_table": {
+      "columns": [
+        {"key": "name", "label": "Endpoint"},
+        {"key": "requests", "label": "Reqs"},
+        {"key": "avg", "label": "Avg", "highlight": {"warn": 200, "fail": 500}},
+        {"key": "p95", "label": "P95", "highlight": {"warn": 300, "fail": 800}},
+        {"key": "error_rate", "label": "Err %", "highlight": {"warn": 1, "fail": 5}},
+        {"key": "rps", "label": "RPS"}
+      ]
+    }
+  }
+}

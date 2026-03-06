@@ -1,24 +1,11 @@
 name: 'CI Load Test'
-description: 'Run load tests using Locomotive library'
+description: 'Run load tests using Locomotive library (pip install locomotive)'
 
 inputs:
   config:
     description: 'Path to loconfig config file'
     required: false
     default: 'loconfig.json'
-
-  lib_repo:
-    description: 'Repository of Locomotive library (owner/repo)'
-    required: true
-
-  lib_token:
-    description: 'GitHub PAT token for accessing private lib repo (required for private repos)'
-    required: false
-
-  lib_ref:
-    description: 'Git ref (branch/tag) to checkout from lib repo'
-    required: false
-    default: 'master'
 
   users:
     description: 'Override number of users'
@@ -68,49 +55,23 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Verify locomotive is checked out
-      shell: bash
-      run: |
-        if [ ! -d "locomotive" ]; then
-          echo "Error: locomotive library not found!"
-          echo "Make sure to checkout the library before using this action:"
-          echo "  - name: Checkout locomotive"
-          echo "    uses: actions/checkout@v4"
-          echo "    with:"
-          echo "      repository: YOUR_ORG/locomotive"
-          echo "      path: locomotive"
-          echo "      ref: master  # или main, в зависимости от вашей default branch"
-          echo "      # Для приватных репо добавьте token с PAT"
-          exit 1
-        fi
-        echo "✓ locomotive found"
-
     - name: Install dependencies
       shell: bash
       run: |
-        # Check Python availability
         if ! command -v python3 &> /dev/null; then
           echo "Error: python3 not found!"
           echo "Please add 'Setup Python' step before using this action:"
           echo "  - name: Set up Python"
           echo "    uses: actions/setup-python@v5"
           echo "    with:"
-          echo "      python-version: '3.9'"
+          echo "      python-version: '3.12'"
           exit 1
         fi
 
         python3 -m pip install --quiet --upgrade pip
-        python3 -m pip install --quiet locust PyYAML
+        python3 -m pip install --quiet locomotive locust
 
-        # Install locomotive from local checkout
-        if [ ! -d "locomotive" ]; then
-          echo "Error: locomotive directory not found!"
-          exit 1
-        fi
-        echo "Installing locomotive..."
-        python3 -m pip install --quiet ./locomotive
-
-        echo "✓ Installed:"
+        echo "Installed:"
         python3 -m pip show locomotive | grep -E "Name|Version" || true
 
     - name: Download baseline
@@ -128,9 +89,6 @@ runs:
     - name: Sync storage path
       shell: bash
       run: |
-        # Read artifacts.storage from config and create symlink if it differs
-        # from the download path. This ensures loco reads/writes through
-        # loadtest-artifacts/ regardless of what the config says.
         STORAGE_DIR=$(python3 -c "
         import json, os, re
         cfg_path = '${{ inputs.config }}'
@@ -149,9 +107,9 @@ runs:
 
         if [ "$STORAGE_DIR" != "loadtest-artifacts" ] && [ ! -e "$STORAGE_DIR" ]; then
           ln -s "$(pwd)/loadtest-artifacts" "$STORAGE_DIR"
-          echo "✓ Created symlink: $STORAGE_DIR -> loadtest-artifacts"
+          echo "Created symlink: $STORAGE_DIR -> loadtest-artifacts"
         else
-          echo "✓ Storage path matches download path"
+          echo "Storage path matches download path"
         fi
 
     - name: Run load test
@@ -160,7 +118,6 @@ runs:
       run: |
         echo "=== Running Load Test ==="
 
-        # Build command - --config must come before subcommand
         CMD="loco --config ${{ inputs.config }} ci"
 
         if [ -n "${{ inputs.users }}" ]; then
@@ -181,7 +138,6 @@ runs:
         echo ""
         echo "=== Exit code: ${EXIT_CODE:-0} ==="
 
-        # Find metrics and report paths (always in loadtest-artifacts via symlink)
         ARTIFACTS_DIR="loadtest-artifacts/runs"
         if [ -d "$ARTIFACTS_DIR" ]; then
           RUN_DIR=$(ls -td "$ARTIFACTS_DIR"/*/ 2>/dev/null | head -1)
@@ -193,7 +149,6 @@ runs:
               echo "metrics_path=$METRICS_PATH" >> $GITHUB_OUTPUT
               echo "report_path=$REPORT_PATH" >> $GITHUB_OUTPUT
 
-              # Extract status from analysis if exists
               ANALYSIS_PATH="$RUN_DIR/analysis.json"
               if [ -f "$ANALYSIS_PATH" ]; then
                 STATUS=$(python3 -c "import json; print(json.load(open('$ANALYSIS_PATH')).get('status', 'UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
@@ -292,20 +247,20 @@ runs:
           const errorRate = fmt(metrics.error_rate);
           const requests = metrics.requests || 'N/A';
 
-          let statusEmoji = '⚪';
+          let statusEmoji = '';
           let statusText = 'Unknown';
 
           if (fs.existsSync(analysisPath)) {
             const analysis = JSON.parse(fs.readFileSync(analysisPath, 'utf8'));
             const status = analysis.status || 'UNKNOWN';
             if (status === 'PASS') {
-              statusEmoji = '✅';
+              statusEmoji = 'PASS';
               statusText = 'Passed';
             } else if (status === 'WARNING') {
-              statusEmoji = '⚠️';
+              statusEmoji = 'WARNING';
               statusText = 'Warning';
             } else if (status === 'DEGRADATION') {
-              statusEmoji = '❌';
+              statusEmoji = 'FAIL';
               statusText = 'Degradation';
             } else {
               statusText = status;
@@ -313,17 +268,17 @@ runs:
           } else {
             const errRate = parseFloat(metrics.error_rate) || 0;
             if (errRate < 5) {
-              statusEmoji = '✅';
+              statusEmoji = 'PASS';
               statusText = 'Passed';
             } else {
-              statusEmoji = '❌';
+              statusEmoji = 'FAIL';
               statusText = 'Failed';
             }
           }
 
           const runId = process.env.GITHUB_RUN_ID || 'unknown';
           const body = [
-            `## Load Test Results ${statusEmoji} ${statusText}`,
+            `## Load Test Results — ${statusText}`,
             '',
             '| Metric | Value |',
             '|--------|-------|',

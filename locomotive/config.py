@@ -8,6 +8,10 @@ from typing import Any, Dict, Union
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
+# Built-in runtime placeholders that should NOT be resolved at config load time.
+# These are handled at runtime by the generated locustfile's _resolve() function.
+_RUNTIME_PLACEHOLDERS = frozenset({"random", "timestamp", "iteration"})
+
 
 def _parse_env_ref(ref: str) -> tuple:
     """Parse environment variable reference, supporting ${VAR:-default} syntax."""
@@ -25,6 +29,9 @@ def _resolve_env_value(value: Any) -> Any:
     if isinstance(value, str):
         def repl(match: re.Match) -> str:
             ref = match.group(1) or match.group(2) or ""
+            name, _ = _parse_env_ref(ref)
+            if name in _RUNTIME_PLACEHOLDERS:
+                return match.group(0)  # preserve as-is
             name, default = _parse_env_ref(ref)
             return os.environ.get(name, default)
 
@@ -77,7 +84,7 @@ def _load_data_file(path: Path) -> Dict[str, Any]:
 def load_config(path: Union[str, Path]) -> Dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
-        return {}
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     data = _load_data_file(config_path)
     data = _resolve_env_value(data)
     return _resolve_paths(data, config_path.parent)

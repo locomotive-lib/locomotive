@@ -1,0 +1,68 @@
+{
+  "runs": [
+    {
+      "run_id": "baseline",
+      "started_at": "2026-03-01T10:00:00+00:00",
+      "rps": 145.2,
+      "avg_ms": 42.3,
+      "median_ms": 38.0,
+      "p95_ms": 95.0,
+      "p99_ms": 142.0,
+      "max_ms": 187.4,
+      "error_rate": 0.8,
+      "error_rate_4xx": null,
+      "error_rate_5xx": null,
+      "error_rate_503": null,
+      "requests": 8712,
+      "failures": 70
+    },
+    {
+      "run_id": "run-pass",
+      "started_at": "2026-03-03T10:00:00+00:00",
+      "rps": 152.8,
+      "avg_ms": 39.1,
+      "median_ms": 35.0,
+      "p95_ms": 88.0,
+      "p99_ms": 131.0,
+      "max_ms": 165.2,
+      "error_rate": 0.5,
+      "error_rate_4xx": null,
+      "error_rate_5xx": null,
+      "error_rate_503": null,
+      "requests": 9168,
+      "failures": 46
+    },
+    {
+      "run_id": "run-warn",
+      "started_at": "2026-03-04T10:00:00+00:00",
+      "rps": 138.4,
+      "avg_ms": 48.7,
+      "median_ms": 43.0,
+      "p95_ms": 112.0,
+      "p99_ms": 198.0,
+      "max_ms": 245.8,
+      "error_rate": 1.2,
+      "error_rate_4xx": null,
+      "error_rate_5xx": null,
+      "error_rate_503": null,
+      "requests": 8304,
+      "failures": 100
+    },
+    {
+      "run_id": "run-degrade",
+      "started_at": "2026-03-05T10:00:00+00:00",
+      "rps": 98.5,
+      "avg_ms": 78.4,
+      "median_ms": 65.0,
+      "p95_ms": 185.0,
+      "p99_ms": 412.0,
+      "max_ms": 524.1,
+      "error_rate": 6.3,
+      "error_rate_4xx": null,
+      "error_rate_5xx": null,
+      "error_rate_503": null,
+      "requests": 5910,
+      "failures": 372
+    }
+  ]
+}
