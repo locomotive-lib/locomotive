@@ -8,7 +8,7 @@
 A Python library and CLI for integrating load testing into CI/CD pipelines. Powered by Locust under the hood, but lets you define tests declaratively in JSON/YAML config — no Python code required. Generates HTML reports with charts, regression analysis and baseline comparison, with full theming and branding support.
 
 
-![Default Report](docs/images/report-default-light.png)
+![Default Report](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-default-light.png?raw=true)
 
 ## Features
 
@@ -520,25 +520,25 @@ The quickest way — pick a preset. A preset defines a set of KPI cards, charts,
 <details>
 <summary><b>Throughput</b> — <code>throughput</code> preset + custom pastel theme + branding</summary>
 
-![Throughput](docs/images/report-throughput.png)
+![Throughput](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-throughput.png?raw=true)
 </details>
 
 <details>
 <summary><b>Branded</b> — default preset + custom KPI cards + branding + accent <code>#059669</code></summary>
 
-![Branded](docs/images/report-branded.png)
+![Branded](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-branded.png?raw=true)
 </details>
 
 <details>
 <summary><b>Latency</b> — <code>latency</code> preset + custom dark theme + branding</summary>
 
-![Latency](docs/images/report-latency.png)
+![Latency](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-latency.png?raw=true)
 </details>
 
 <details>
 <summary><b>Errors</b> — <code>errors</code> preset + dark theme, accent <code>#ef4444</code></summary>
 
-![Errors](docs/images/report-errors.png)
+![Errors](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-errors.png?raw=true)
 </details>
 
 All reports above are examples of customization on top of presets: theme, colors, branding, and card layout are configured in the `report` section.
@@ -547,7 +547,7 @@ All reports above are examples of customization on top of presets: theme, colors
 
 By default, the report uses a light theme. To switch to dark mode, just set `"mode": "dark"` — no additional configuration needed:
 
-![Dark Theme](docs/images/report-dark.png)
+![Dark Theme](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-dark.png?raw=true)
 *Default dark theme — only `"theme": {"mode": "dark"}`*
 
 ```jsonc
@@ -581,7 +581,7 @@ Display your company or project name in the report footer:
 
 ### Full color control
 
-![Custom Dark Theme](docs/images/report-dark-custom.png)
+![Custom Dark Theme](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-dark-custom.png?raw=true)
 *Fully custom theme: all CSS variables overridden, custom charts, branding, and endpoint table*
 
 All theme CSS variables can be overridden:
@@ -731,7 +731,7 @@ Configure which metrics to show on trend charts (each metric gets its own chart)
 }
 ```
 
-![Trends Report](docs/images/report-trends.png)
+![Trends Report](https://github.com/locomotive-lib/locomotive/blob/master/docs/images/report-trends.png?raw=true)
 *Trends section — metric changes across runs. Accent color `#8b5cf6`*
 
 Available trend metrics: `rps`, `avg_ms`, `median_ms`, `p95_ms`, `p99_ms`, `max_ms`, `error_rate`, `error_rate_4xx`, `error_rate_5xx`, `error_rate_503`, `requests`, `failures`.
