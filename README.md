@@ -248,6 +248,20 @@ Baseline is saved when you pass `--set-baseline` (in the built-in Action this ha
 
 On the first run there is no baseline — regression analysis is skipped (but gate checks still work). Starting from the second successful run, the report shows deltas: how much latency, RPS, and error rate changed compared to the previous run.
 
+### Branch-aware baselines
+
+When using the built-in GitHub Action, baselines are **branch-aware**:
+
+| Scenario | Baseline source | Why |
+|----------|----------------|-----|
+| **Push to branch** | Latest baseline from **the same branch** | Track regressions within the branch |
+| **Pull request** | Latest baseline from **the target branch** | Show what the PR would change in the target |
+| **First run on a new branch** | Falls back to **main** branch baseline | New branches start from the main baseline |
+
+Each branch listed in `push.branches` maintains its own baseline. PRs always compare against the target branch (e.g., a PR into `main` uses `main`'s baseline, a PR into `release` uses `release`'s baseline).
+
+You can change the fallback branch via the `fallback_branch` input (default: `main`).
+
 ### Analysis rules
 
 Rules compare current metrics against baseline and produce a status:
@@ -467,7 +481,7 @@ jobs:
 
 The Action automatically:
 - Installs `locomotive` from PyPI
-- Downloads baseline from previous runs
+- Downloads **branch-aware baseline** — on PR uses the target branch's baseline, on push uses the current branch's baseline, with fallback to `main`
 - Runs tests, analysis, and generates the HTML report
 - Uploads the HTML report and all artifacts (metrics, analysis, CSV) to GitHub Actions Artifacts
 - Saves baseline on successful runs (`set_baseline: true` by default)
@@ -484,6 +498,8 @@ Action parameters:
 | `post_pr_comment` | `true` | Post results as a PR comment |
 | `baseline_artifact` | `loadtest-baseline` | Artifact name for baseline storage |
 | `results_artifact` | `loadtest-results` | Artifact name for results |
+| `workflow` | (empty) | Workflow file name to search for baseline artifacts (empty = search all workflows) |
+| `fallback_branch` | `main` | Fallback branch when no branch-specific baseline exists |
 | `github_token` | `github.token` | Token for PR comments. Uses the built-in `github.token` by default — no need to create a separate token |
 
 Action outputs:

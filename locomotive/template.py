@@ -337,9 +337,9 @@ jobs:
           name: loadtest-results
           path: artifacts/
 
-      # Set baseline on main branch
+      # Set baseline on push (each branch listed in push.branches maintains its own baseline)
       - name: Set baseline
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: loco --config {config_name} ci --set-baseline
 '''
     

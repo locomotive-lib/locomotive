@@ -35,6 +35,16 @@ inputs:
     required: false
     default: 'true'
 
+  workflow:
+    description: 'Workflow file name to search for baseline artifacts (empty = search all workflows)'
+    required: false
+    default: ''
+
+  fallback_branch:
+    description: 'Fallback branch for baseline when no branch-specific baseline exists'
+    required: false
+    default: 'main'
+
   github_token:
     description: 'GitHub token for posting PR comments (uses github.token if not provided)'
     required: false
@@ -74,14 +84,42 @@ runs:
         echo "Installed:"
         python3 -m pip show locomotive | grep -E "Name|Version" || true
 
-    - name: Download baseline
+    - name: Resolve baseline branch
+      id: resolve-branch
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BRANCH="${{ github.event.pull_request.base.ref }}"
+        else
+          BRANCH="${{ github.ref_name }}"
+        fi
+        echo "baseline_branch=$BRANCH" >> $GITHUB_OUTPUT
+        echo "Resolved baseline branch: $BRANCH"
+
+    - name: Download baseline (branch)
+      id: download-branch-baseline
       uses: dawidd6/action-download-artifact@v6
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
-        workflow: ci.yml
+        workflow: ${{ inputs.workflow }}
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
+        branch: ${{ steps.resolve-branch.outputs.baseline_branch }}
+        workflow_conclusion: ""
+        check_artifacts: true
+        if_no_artifact_found: warn
+
+    - name: Download baseline (fallback)
+      if: steps.download-branch-baseline.outcome != 'success' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
+      uses: dawidd6/action-download-artifact@v6
+      continue-on-error: true
+      with:
+        github_token: ${{ inputs.github_token || github.token }}
+        workflow: ${{ inputs.workflow }}
+        name: ${{ inputs.baseline_artifact }}
+        path: loadtest-artifacts/
+        branch: ${{ inputs.fallback_branch }}
         workflow_conclusion: ""
         check_artifacts: true
         if_no_artifact_found: warn
