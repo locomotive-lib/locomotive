@@ -108,10 +108,22 @@ runs:
         branch: ${{ steps.resolve-branch.outputs.baseline_branch }}
         workflow_conclusion: ""
         check_artifacts: true
-        if_no_artifact_found: error
+        if_no_artifact_found: warn
+
+    - name: Check baseline downloaded
+      id: check-baseline
+      shell: bash
+      run: |
+        if [ -f "loadtest-artifacts/baseline.json" ]; then
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "Baseline found"
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo "No baseline found for branch, will try fallback"
+        fi
 
     - name: Download baseline (fallback)
-      if: steps.download-branch-baseline.outcome != 'success' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
+      if: steps.check-baseline.outputs.found != 'true' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
       uses: dawidd6/action-download-artifact@v6
       continue-on-error: true
       with:
