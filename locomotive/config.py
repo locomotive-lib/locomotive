@@ -6,11 +6,15 @@ import re
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Set, Union
 
+from .scenario import RUNTIME_FUNCTIONS
+
 _ENV_RE = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 # Built-in runtime placeholders that should NOT be resolved at config load time.
 # These are handled at runtime by the generated locustfile's _resolve() method.
-_RUNTIME_PLACEHOLDERS = frozenset({"random", "timestamp", "iteration"})
+# The registry lives in scenario.py — the single source of truth shared by the
+# loader and the code generator.
+_RUNTIME_PLACEHOLDERS = RUNTIME_FUNCTIONS
 
 # Namespaced placeholders resolved at runtime (captured variables, data pools).
 _RUNTIME_NAMESPACES = ("var:", "data:")
@@ -56,8 +60,12 @@ def is_runtime_placeholder(ref: str, capture_names: FrozenSet[str] = frozenset()
     """Return True if a ${...} reference must be left for runtime resolution."""
     if ref.startswith(_RUNTIME_NAMESPACES):
         return True
+    # Function calls: name before the first ':' (handles args that contain
+    # ':-', e.g. ${randint:1:-100}, which _parse_env_ref would misparse).
+    if ref.partition(":")[0] in _RUNTIME_PLACEHOLDERS:
+        return True
     name, _ = _parse_env_ref(ref)
-    return name in _RUNTIME_PLACEHOLDERS or name in capture_names
+    return name in capture_names
 
 
 def _resolve_env_value(value: Any, capture_names: FrozenSet[str] = frozenset()) -> Any:

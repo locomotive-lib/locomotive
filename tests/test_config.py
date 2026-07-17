@@ -188,3 +188,33 @@ class TestLoadConfigCapturePreservation:
         result = load_config(config_path)
         headers = result["scenario"]["headers"]
         assert headers["Authorization"] == "Bearer ${auth_token}"
+
+
+class TestRuntimeFunctionPreservation:
+    """D2: new function placeholders must survive config loading."""
+
+    @pytest.mark.parametrize("value", [
+        "${uuid}",
+        "${randint:1:100}",
+        "${randint:1:-100}",
+        "${choice:a,b,c}",
+        "${now:%H:%M}",
+        "${random:16}",
+    ])
+    def test_preserved(self, value):
+        assert _resolve_env_value(value) == value
+
+    def test_similar_env_name_still_resolved(self, monkeypatch):
+        monkeypatch.setenv("UUID_SUFFIX", "abc")
+        assert _resolve_env_value("${UUID_SUFFIX}") == "abc"
+
+    @pytest.mark.parametrize("ref", [
+        "uuid", "randint:1:100", "randint:1:-100", "choice:a,b", "now:%H:%M", "random:4",
+    ])
+    def test_is_runtime_placeholder(self, ref):
+        assert is_runtime_placeholder(ref) is True
+
+    def test_registry_shared_with_generator(self):
+        from locomotive.config import _RUNTIME_PLACEHOLDERS
+        from locomotive.scenario import RUNTIME_FUNCTIONS
+        assert _RUNTIME_PLACEHOLDERS is RUNTIME_FUNCTIONS

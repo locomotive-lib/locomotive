@@ -9,6 +9,14 @@ from .utils import ensure_dir, write_text
 
 _NAME_RE = re.compile(r"[^a-zA-Z0-9_]+")
 
+# Canonical registry of runtime placeholder functions. This is the single
+# source of truth shared with the config loader (config.py imports it), so
+# ${uuid}, ${randint:1:100} etc. survive load-time env resolution and are
+# resolved at runtime by the generated locustfile.
+RUNTIME_FUNCTIONS = frozenset(
+    {"timestamp", "random", "iteration", "uuid", "randint", "choice", "now"}
+)
+
 
 def _slugify(value: str) -> str:
     value = value.strip().lower()
@@ -64,7 +72,8 @@ class ScenarioGenerator:
         ${var:name}   - variable captured via "capture"
         ${env:NAME}   - environment variable (also ${env:NAME:-default})
         ${NAME}       - captured variable first, then environment variable
-        ${timestamp}, ${random}, ${iteration} - built-in generators
+        ${timestamp}, ${random[:N]}, ${iteration}, ${uuid},
+        ${randint:A:B}, ${choice:a,b,c}, ${now:fmt} - built-in generators
     """
 
     def __init__(
@@ -144,6 +153,7 @@ class ScenarioGenerator:
             "import re",
             "import time",
             "import random",
+            "import uuid",
             "from locust import HttpUser, task, between, tag",
             "",
         ]
@@ -192,6 +202,47 @@ class ScenarioGenerator:
             "        return name, default",
             "    return ref, ''",
             "",
+            "",
+            f"_RUNTIME_FUNCTIONS = frozenset({sorted(RUNTIME_FUNCTIONS)!r})",
+            "",
+            "",
+            "def _call_function(name, args):",
+            "    '''Dispatch a ${func:args} runtime placeholder.",
+            "",
+            "    Argument errors degrade gracefully (defaults or empty string)",
+            "    instead of crashing the load test.",
+            "    '''",
+            "    if name == 'timestamp':",
+            "        return _timestamp()",
+            "    if name == 'iteration':",
+            "        return str(_iteration())",
+            "    if name == 'uuid':",
+            "        return str(uuid.uuid4())",
+            "    if name == 'random':",
+            "        try:",
+            "            length = int(args) if args else 8",
+            "        except ValueError:",
+            "            length = 8",
+            "        return _random_string(max(1, length))",
+            "    if name == 'randint':",
+            "        lo, _, hi = args.partition(':')",
+            "        try:",
+            "            a, b = int(lo), int(hi)",
+            "        except ValueError:",
+            "            return ''",
+            "        if a > b:",
+            "            a, b = b, a",
+            "        return str(random.randint(a, b))",
+            "    if name == 'choice':",
+            "        options = [item for item in args.split(',') if item != '']",
+            "        return random.choice(options) if options else ''",
+            "    if name == 'now':",
+            "        try:",
+            "            return time.strftime(args or '%Y-%m-%dT%H:%M:%S')",
+            "        except ValueError:",
+            "            return time.strftime('%Y-%m-%dT%H:%M:%S')",
+            "    return ''",
+            "",
         ]
 
     def _generate_resolver_methods(self) -> List[str]:
@@ -207,8 +258,12 @@ class ScenarioGenerator:
             "            ${env:NAME:-def}    - environment variable with default",
             "            ${NAME}             - captured variable, then env variable",
             "            ${timestamp}        - current timestamp ms",
-            "            ${random}           - random string",
+            "            ${random}           - random string (${random:N} for length N)",
             "            ${iteration}        - incrementing counter",
+            "            ${uuid}             - random UUID4",
+            "            ${randint:A:B}      - random integer between A and B",
+            "            ${choice:a,b,c}     - random element of a comma-separated list",
+            "            ${now:%Y-%m-%d}     - current time via strftime (default ISO)",
             "        '''",
             "        if not isinstance(value, str):",
             "            return value",
@@ -222,12 +277,9 @@ class ScenarioGenerator:
             "            if key.startswith('env:'):",
             "                name, default = _parse_env_ref(key[4:])",
             "                return os.environ.get(name, default)",
-            "            if key == 'timestamp':",
-            "                return _timestamp()",
-            "            if key == 'random':",
-            "                return _random_string()",
-            "            if key == 'iteration':",
-            "                return str(_iteration())",
+            "            func_name, _, func_args = key.partition(':')",
+            "            if func_name in _RUNTIME_FUNCTIONS:",
+            "                return _call_function(func_name, func_args)",
             "            variables = getattr(self, '_vars', {})",
             "            name, default = _parse_env_ref(key)",
             "            if name in variables:",

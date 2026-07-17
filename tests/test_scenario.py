@@ -477,3 +477,98 @@ class TestGeneratedCodeRobustness:
         user = _make_user(ns)
         user.on_start()
         assert user.client.calls[0]["params"] == {"warm": "1"}
+
+
+# ── D2: rich dynamic functions ────────────────────────────────────────
+
+
+class TestDynamicFunctions:
+    def _user(self, tmp_path):
+        scenario = {"requests": [{"name": "P", "method": "GET", "path": "/p"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        return _make_user(ns)
+
+    def test_uuid(self, tmp_path):
+        user = self._user(tmp_path)
+        value = user._resolve("${uuid}")
+        assert len(value) == 36
+        assert value.count("-") == 4
+        # Two calls produce different values
+        assert user._resolve("${uuid}") != value
+
+    def test_random_with_length(self, tmp_path):
+        user = self._user(tmp_path)
+        assert len(user._resolve("${random:16}")) == 16
+        assert len(user._resolve("${random}")) == 8
+
+    def test_random_bad_length_falls_back(self, tmp_path):
+        user = self._user(tmp_path)
+        assert len(user._resolve("${random:abc}")) == 8
+
+    def test_randint_in_range(self, tmp_path):
+        user = self._user(tmp_path)
+        for _ in range(20):
+            value = int(user._resolve("${randint:1:6}"))
+            assert 1 <= value <= 6
+
+    def test_randint_negative_bounds(self, tmp_path):
+        user = self._user(tmp_path)
+        value = int(user._resolve("${randint:-5:-1}"))
+        assert -5 <= value <= -1
+
+    def test_randint_swapped_bounds(self, tmp_path):
+        user = self._user(tmp_path)
+        value = int(user._resolve("${randint:10:1}"))
+        assert 1 <= value <= 10
+
+    def test_randint_bad_args_empty(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${randint:a:b}") == ""
+        assert user._resolve("${randint:1}") == ""
+
+    def test_choice(self, tmp_path):
+        user = self._user(tmp_path)
+        for _ in range(10):
+            assert user._resolve("${choice:red,green,blue}") in {"red", "green", "blue"}
+
+    def test_choice_empty_list(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${choice:}") == ""
+
+    def test_now_default_iso(self, tmp_path):
+        user = self._user(tmp_path)
+        value = user._resolve("${now}")
+        assert len(value) == 19 and value[4] == "-" and value[10] == "T"
+
+    def test_now_custom_format_with_colons(self, tmp_path):
+        user = self._user(tmp_path)
+        value = user._resolve("${now:%H:%M}")
+        assert len(value) == 5 and value[2] == ":"
+
+    def test_now_year_only(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${now:%Y}").isdigit()
+
+    def test_functions_inside_json_body(self, tmp_path):
+        scenario = {
+            "requests": [
+                {
+                    "name": "Create",
+                    "method": "POST",
+                    "path": "/items",
+                    "json": {"id": "${uuid}", "qty": "${randint:1:3}"},
+                }
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.task_1_create()
+        body = user.client.calls[-1]["json"]
+        assert len(body["id"]) == 36
+        assert int(body["qty"]) in {1, 2, 3}
+
+    def test_function_names_reserved_over_env(self, tmp_path, monkeypatch):
+        # Function names win over env vars of the same name
+        monkeypatch.setenv("uuid", "not-a-uuid")
+        user = self._user(tmp_path)
+        assert user._resolve("${uuid}") != "not-a-uuid"

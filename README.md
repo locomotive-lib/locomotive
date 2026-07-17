@@ -181,8 +181,14 @@ String values in the config support runtime placeholders — resolved at request
 | `${env:NAME}` | Environment variable (explicit namespace, also `${env:NAME:-default}`) |
 | `${var:name}` | Variable captured via `capture` (explicit namespace) |
 | `${timestamp}` | Current timestamp in milliseconds |
-| `${random}` | Random alphanumeric string (8 chars) |
+| `${random}` | Random alphanumeric string (8 chars); `${random:16}` — custom length |
+| `${uuid}` | Random UUID4 (e.g. for unique resource IDs) |
+| `${randint:A:B}` | Random integer between A and B inclusive: `${randint:1:100}` |
+| `${choice:a,b,c}` | Random element of a comma-separated list |
+| `${now:%Y-%m-%d}` | Current time via `strftime` format (colons allowed: `${now:%H:%M}`); `${now}` — ISO format |
 | `${iteration}` | Request counter across the run: 1, 2, 3, ... — increments on every call by any virtual user. Useful for unique data: `"name": "user-${iteration}"` |
+
+Function names (`timestamp`, `random`, `iteration`, `uuid`, `randint`, `choice`, `now`) are reserved — an environment variable with the same name cannot be referenced as a bare `${name}` (use `${env:name}` instead). Invalid function arguments degrade gracefully (defaults or empty string) instead of crashing the run.
 
 Placeholders also work in `path` — e.g. `"path": "/users/${var:user_id}"`. The request `name` keeps the template string, so Locust stats group all calls of the endpoint into one row regardless of the substituted values.
 
