@@ -175,12 +175,16 @@ String values in the config support runtime placeholders — resolved at request
 
 | Placeholder | Description |
 |-------------|-------------|
-| `${ENV_VAR}` | Environment variable |
+| `${ENV_VAR}` | Captured variable (see Capture) first, then environment variable |
 | `$ENV_VAR` | Environment variable (short syntax) |
 | `${ENV_VAR:-default}` | Environment variable with fallback |
+| `${env:NAME}` | Environment variable (explicit namespace, also `${env:NAME:-default}`) |
+| `${var:name}` | Variable captured via `capture` (explicit namespace) |
 | `${timestamp}` | Current timestamp in milliseconds |
 | `${random}` | Random alphanumeric string (8 chars) |
 | `${iteration}` | Request counter across the run: 1, 2, 3, ... — increments on every call by any virtual user. Useful for unique data: `"name": "user-${iteration}"` |
+
+Placeholders also work in `path` — e.g. `"path": "/users/${var:user_id}"`. The request `name` keeps the template string, so Locust stats group all calls of the endpoint into one row regardless of the substituted values.
 
 ### Authentication
 
@@ -193,7 +197,8 @@ The `auth` section in `scenario` adds an auth header to all requests:
 // API Key — adds a custom header with the key
 "auth": {"type": "api_key", "header": "X-API-Key", "key": "${API_KEY}"}
 
-// Basic Auth — adds Authorization: Basic <user>:<password> header
+// Basic Auth — adds a base64-encoded Authorization: Basic header.
+// Credentials are resolved and encoded at runtime, never embedded as a ready-made header.
 "auth": {"type": "basic", "username": "${USER}", "password": "${PASS}"}
 ```
 
@@ -226,6 +231,8 @@ Everything is configured declaratively — no need to edit the generated locustf
 ```
 
 `capture` is a `{"variable_name": "json.path"}` dict. The path is dot-separated: `"data.token"` means `response["data"]["token"]`.
+
+Captured values are stored per virtual user and can be referenced from any request — in headers, paths, query, or bodies — as `${auth_token}` or explicitly as `${var:auth_token}`. A bare `${name}` checks captured variables first, then environment variables. If a capture fails (unexpected response shape), the variable resolves to an empty string.
 
 ## Rules vs Gates
 

@@ -4,13 +4,16 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, FrozenSet, Set, Union
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 # Built-in runtime placeholders that should NOT be resolved at config load time.
-# These are handled at runtime by the generated locustfile's _resolve() function.
+# These are handled at runtime by the generated locustfile's _resolve() method.
 _RUNTIME_PLACEHOLDERS = frozenset({"random", "timestamp", "iteration"})
+
+# Namespaced placeholders resolved at runtime (captured variables, data pools).
+_RUNTIME_NAMESPACES = ("var:", "data:")
 
 
 def _parse_env_ref(ref: str) -> tuple:
@@ -25,21 +28,55 @@ def _parse_env_ref(ref: str) -> tuple:
     return ref, ""
 
 
-def _resolve_env_value(value: Any) -> Any:
+def _collect_capture_names(data: Any) -> Set[str]:
+    """Collect variable names defined via "capture" anywhere in the config.
+
+    Placeholders referencing captured variables (e.g. ${auth_token}) must
+    survive config loading so the generated locustfile can resolve them at
+    runtime from the values captured per virtual user.
+    """
+    names: Set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            capture = node.get("capture")
+            if isinstance(capture, dict):
+                names.update(str(key) for key in capture.keys())
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return names
+
+
+def is_runtime_placeholder(ref: str, capture_names: FrozenSet[str] = frozenset()) -> bool:
+    """Return True if a ${...} reference must be left for runtime resolution."""
+    if ref.startswith(_RUNTIME_NAMESPACES):
+        return True
+    name, _ = _parse_env_ref(ref)
+    return name in _RUNTIME_PLACEHOLDERS or name in capture_names
+
+
+def _resolve_env_value(value: Any, capture_names: FrozenSet[str] = frozenset()) -> Any:
     if isinstance(value, str):
         def repl(match: re.Match) -> str:
             ref = match.group(1) or match.group(2) or ""
-            name, _ = _parse_env_ref(ref)
-            if name in _RUNTIME_PLACEHOLDERS:
+            if is_runtime_placeholder(ref, capture_names):
                 return match.group(0)  # preserve as-is
+            if ref.startswith("env:"):
+                # Explicit env namespace: ${env:NAME} / ${env:NAME:-default}
+                ref = ref[4:]
             name, default = _parse_env_ref(ref)
             return os.environ.get(name, default)
 
         return _ENV_RE.sub(repl, value)
     if isinstance(value, list):
-        return [_resolve_env_value(item) for item in value]
+        return [_resolve_env_value(item, capture_names) for item in value]
     if isinstance(value, dict):
-        return {key: _resolve_env_value(item) for key, item in value.items()}
+        return {key: _resolve_env_value(item, capture_names) for key, item in value.items()}
     return value
 
 
@@ -86,5 +123,6 @@ def load_config(path: Union[str, Path]) -> Dict[str, Any]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     data = _load_data_file(config_path)
-    data = _resolve_env_value(data)
+    capture_names = frozenset(_collect_capture_names(data))
+    data = _resolve_env_value(data, capture_names)
     return _resolve_paths(data, config_path.parent)

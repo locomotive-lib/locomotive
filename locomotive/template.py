@@ -6,8 +6,26 @@ It can optionally read an OpenAPI spec to pre-populate the requests section.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_PATH_PARAM_RE = re.compile(r"\{([^{}/]+)\}")
+
+
+def _convert_path_params(path: str) -> str:
+    """Convert OpenAPI path params to Locomotive placeholders.
+
+    "/users/{id}" -> "/users/${PATH_ID:-1}" — resolves from the PATH_ID
+    environment variable, with "1" as a scaffold default so the generated
+    config works out of the box. Users replace it with a real value,
+    an env var, or a captured variable (${var:...}).
+    """
+    def repl(match: re.Match) -> str:
+        name = re.sub(r"[^A-Za-z0-9]+", "_", match.group(1)).strip("_").upper()
+        return "${PATH_" + (name or "PARAM") + ":-1}"
+
+    return _PATH_PARAM_RE.sub(repl, path)
 
 
 def _load_openapi(path: Path) -> Dict[str, Any]:
@@ -40,14 +58,20 @@ def _extract_endpoints(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
             operation_id = operation.get("operationId", "")
             tags = operation.get("tags", [])
             
-            # Basic request template
+            # Basic request template. The name keeps the original template
+            # path ({id}) so Locust stats group all calls per endpoint.
             req: Dict[str, Any] = {
                 "name": summary or operation_id or f"{method.upper()} {path}",
                 "method": method.upper(),
-                "path": path,
+                "path": _convert_path_params(path),
                 "weight": 1,
             }
-            
+            if "{" in path:
+                req["_comment_path"] = (
+                    "Path params converted to ${PATH_*:-1} placeholders - "
+                    "set the env vars or replace with real values"
+                )
+
             # Add tags if present
             if tags:
                 req["tags"] = tags

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .utils import ensure_dir, write_text
 
@@ -33,7 +33,7 @@ def _safe_float(value: Any, default: float) -> float:
 
 class ScenarioGenerator:
     """Generates Locust test files from scenario configuration.
-    
+
     The scenario config format:
     {
         "think_time": {"min": 0.5, "max": 2.0},  # or just a number
@@ -43,13 +43,14 @@ class ScenarioGenerator:
             "token": "${API_TOKEN}"
         },
         "on_start": [  # requests to run once per user at start
-            {"method": "POST", "path": "/login", ...}
+            {"method": "POST", "path": "/login",
+             "capture": {"auth_token": "data.token"}, ...}
         ],
         "requests": [
             {
                 "name": "Get Users",
                 "method": "GET",
-                "path": "/users",
+                "path": "/users/${var:user_id}",
                 "weight": 5,
                 "headers": {},
                 "query": {},
@@ -58,8 +59,14 @@ class ScenarioGenerator:
             }
         ]
     }
+
+    Placeholder namespaces resolved at runtime by the generated file:
+        ${var:name}   - variable captured via "capture"
+        ${env:NAME}   - environment variable (also ${env:NAME:-default})
+        ${NAME}       - captured variable first, then environment variable
+        ${timestamp}, ${random}, ${iteration} - built-in generators
     """
-    
+
     def __init__(
         self,
         scenario: Dict[str, Any],
@@ -68,68 +75,87 @@ class ScenarioGenerator:
         self.scenario = scenario
         self.target = target
         self.requests: List[Dict[str, Any]] = []
-    
+
     def load_requests(self) -> None:
         """Load requests from config."""
         self.requests = self.scenario.get("requests", [])
         if not isinstance(self.requests, list):
             self.requests = []
-        
+
         # Filter by tags if specified
         include_tags = self.target.get("tags") or []
         exclude_tags = self.target.get("exclude_tags") or []
-        
+
         if include_tags or exclude_tags:
             include_set = set(include_tags) if include_tags else None
             exclude_set = set(exclude_tags) if exclude_tags else set()
-            
+
             filtered = []
             for req in self.requests:
-                req_tags = set(req.get("tags", []))
+                req_tags = set(req.get("tags", [])) if isinstance(req, dict) else set()
                 if req_tags & exclude_set:
                     continue
                 if include_set is not None and not (req_tags & include_set):
                     continue
                 filtered.append(req)
             self.requests = filtered
-    
+
     def generate(self, output_dir: Path) -> Path:
         """Generate the locustfile and return its path."""
         self.load_requests()
-        
+
         if not self.requests:
             raise ValueError("scenario.requests must be a non-empty list")
-        
+
+        self._validate_requests(self.requests, "scenario.requests")
+        on_start = self.scenario.get("on_start")
+        if isinstance(on_start, list):
+            self._validate_requests(on_start, "scenario.on_start")
+
         lines = self._generate_imports()
         lines.extend(self._generate_helpers())
         lines.extend(self._generate_user_class())
-        
+
         output_path = output_dir / "generated_locustfile.py"
         ensure_dir(output_dir)
         write_text(output_path, "\n".join(lines) + "\n")
         return output_path
-    
+
+    @staticmethod
+    def _validate_requests(requests: List[Any], section: str) -> None:
+        """Fail early with a clear message instead of silently skipping entries."""
+        for idx, req in enumerate(requests, start=1):
+            if not isinstance(req, dict):
+                raise ValueError(
+                    f"{section}[{idx}] must be an object, got {type(req).__name__}"
+                )
+            path = req.get("path")
+            if not path or not isinstance(path, str):
+                label = req.get("name") or req.get("method") or "request"
+                raise ValueError(
+                    f"{section}[{idx}] ({label!r}) is missing required 'path'"
+                )
+
     def _generate_imports(self) -> List[str]:
         """Generate import statements."""
         return [
+            "import base64",
             "import os",
+            "import re",
             "import time",
             "import random",
             "from locust import HttpUser, task, between, tag",
             "",
         ]
-    
+
     def _generate_helpers(self) -> List[str]:
-        """Generate helper functions for dynamic values."""
+        """Generate module-level helper functions for dynamic values."""
         return [
             "",
             "# Dynamic value generators",
             "_iteration_counter = 0",
             "",
-            "",
-            "def _env(name, default=''):",
-            "    '''Get environment variable.'''",
-            "    return os.environ.get(name, default)",
+            "_PLACEHOLDER_RE = re.compile(r'\\$\\{([^}]+)\\}')",
             "",
             "",
             "def _timestamp():",
@@ -150,47 +176,106 @@ class ScenarioGenerator:
             "    return _iteration_counter",
             "",
             "",
-            "def _resolve(value):",
-            "    '''Resolve dynamic placeholders in string values.",
-            "    ",
-            "    Supports:",
-            "        ${ENV_VAR} - environment variable",
-            "        ${timestamp} - current timestamp ms",
-            "        ${random} - random string",
-            "        ${iteration} - incrementing counter",
-            "    '''",
-            "    if not isinstance(value, str):",
-            "        return value",
-            "    ",
-            "    import re",
-            "    def replace(match):",
-            "        key = match.group(1)",
-            "        if key == 'timestamp':",
-            "            return _timestamp()",
-            "        if key == 'random':",
-            "            return _random_string()",
-            "        if key == 'iteration':",
-            "            return str(_iteration())",
-            "        # Treat as env var",
-            "        return os.environ.get(key, '')",
-            "    ",
-            "    return re.sub(r'\\$\\{([^}]+)\\}', replace, value)",
+            "def _basic_auth(username, password):",
+            "    '''Build a base64-encoded Basic Authorization header value.'''",
+            "    raw = f'{username}:{password}'.encode('utf-8')",
+            "    return 'Basic ' + base64.b64encode(raw).decode('ascii')",
             "",
             "",
-            "def _resolve_dict(d):",
-            "    '''Recursively resolve dynamic values in dict/list.'''",
-            "    if isinstance(d, dict):",
-            "        return {k: _resolve_dict(v) for k, v in d.items()}",
-            "    if isinstance(d, list):",
-            "        return [_resolve_dict(v) for v in d]",
-            "    return _resolve(d)",
+            "def _parse_env_ref(ref):",
+            "    '''Split a VAR:-default (or VAR:default) reference into (name, default).'''",
+            "    if ':-' in ref:",
+            "        name, default = ref.split(':-', 1)",
+            "        return name, default",
+            "    if ':' in ref:",
+            "        name, default = ref.split(':', 1)",
+            "        return name, default",
+            "    return ref, ''",
             "",
         ]
-    
+
+    def _generate_resolver_methods(self) -> List[str]:
+        """Generate the instance-bound placeholder resolver."""
+        return [
+            "",
+            "    def _resolve(self, value):",
+            "        '''Resolve dynamic placeholders in string values.",
+            "",
+            "        Supports:",
+            "            ${var:name}         - captured variable (see \"capture\")",
+            "            ${env:NAME}         - environment variable",
+            "            ${env:NAME:-def}    - environment variable with default",
+            "            ${NAME}             - captured variable, then env variable",
+            "            ${timestamp}        - current timestamp ms",
+            "            ${random}           - random string",
+            "            ${iteration}        - incrementing counter",
+            "        '''",
+            "        if not isinstance(value, str):",
+            "            return value",
+            "",
+            "        def replace(match):",
+            "            key = match.group(1)",
+            "            if key.startswith('var:'):",
+            "                variables = getattr(self, '_vars', {})",
+            "                found = variables.get(key[4:])",
+            "                return '' if found is None else str(found)",
+            "            if key.startswith('env:'):",
+            "                name, default = _parse_env_ref(key[4:])",
+            "                return os.environ.get(name, default)",
+            "            if key == 'timestamp':",
+            "                return _timestamp()",
+            "            if key == 'random':",
+            "                return _random_string()",
+            "            if key == 'iteration':",
+            "                return str(_iteration())",
+            "            variables = getattr(self, '_vars', {})",
+            "            name, default = _parse_env_ref(key)",
+            "            if name in variables:",
+            "                found = variables[name]",
+            "                return '' if found is None else str(found)",
+            "            return os.environ.get(name, default)",
+            "",
+            "        return _PLACEHOLDER_RE.sub(replace, value)",
+            "",
+            "    def _resolve_dict(self, d):",
+            "        '''Recursively resolve dynamic values in dict/list.'''",
+            "        if isinstance(d, dict):",
+            "            return {k: self._resolve_dict(v) for k, v in d.items()}",
+            "        if isinstance(d, list):",
+            "            return [self._resolve_dict(v) for v in d]",
+            "        return self._resolve(d)",
+            "",
+        ]
+
+    def _auth_config(self, base_headers: Dict[str, str]) -> Optional[Tuple[str, str]]:
+        """Apply auth config to base headers.
+
+        Bearer and api_key auth become static header templates (resolved per
+        request). Basic auth is returned as (username, password) so the header
+        can be base64-encoded at runtime after placeholder resolution — the
+        raw credentials are never embedded as a ready-made header.
+        """
+        auth = self.scenario.get("auth")
+        if not isinstance(auth, dict):
+            return None
+        auth_type = str(auth.get("type", "")).lower()
+        if auth_type == "bearer":
+            token = auth.get("token", "${API_TOKEN}")
+            base_headers["Authorization"] = f"Bearer {token}"
+        elif auth_type == "basic":
+            user = auth.get("username", "${API_USER}")
+            password = auth.get("password", "${API_PASSWORD}")
+            return str(user), str(password)
+        elif auth_type == "api_key":
+            header_name = auth.get("header", "X-API-Key")
+            key = auth.get("key", "${API_KEY}")
+            base_headers[header_name] = key
+        return None
+
     def _generate_user_class(self) -> List[str]:
         """Generate the main User class."""
         lines = ["", "class GeneratedUser(HttpUser):"]
-        
+
         # Wait time
         think_time = self.scenario.get("think_time")
         if isinstance(think_time, dict):
@@ -202,161 +287,134 @@ class ScenarioGenerator:
             lines.append(f"    wait_time = between({value}, {value})")
         else:
             lines.append("    wait_time = between(0.5, 2.0)")
-        
+
         # Gather headers
         scenario_headers = self.scenario.get("headers") if isinstance(self.scenario.get("headers"), dict) else {}
         target_headers = self.target.get("headers") if isinstance(self.target.get("headers"), dict) else {}
         base_headers = {**target_headers, **scenario_headers}
-        
-        # Handle auth config
-        auth = self.scenario.get("auth")
-        if isinstance(auth, dict):
-            auth_type = auth.get("type", "").lower()
-            if auth_type == "bearer":
-                token = auth.get("token", "${API_TOKEN}")
-                base_headers["Authorization"] = f"Bearer {token}"
-            elif auth_type == "basic":
-                # Will be resolved at runtime
-                user = auth.get("username", "${API_USER}")
-                password = auth.get("password", "${API_PASSWORD}")
-                base_headers["Authorization"] = f"Basic {user}:{password}"
-            elif auth_type == "api_key":
-                header_name = auth.get("header", "X-API-Key")
-                key = auth.get("key", "${API_KEY}")
-                base_headers[header_name] = key
-        
-        # Store base headers as class attribute
-        if base_headers:
-            lines.append(f"    _base_headers = {repr(base_headers)}")
-        else:
-            lines.append("    _base_headers = {}")
-        
-        # on_start for setup (login, etc.)
+
+        basic_auth = self._auth_config(base_headers)
+
+        # Store base headers as class attribute (placeholders resolved per request)
+        lines.append(f"    _base_headers = {repr(base_headers)}")
+
+        lines.extend(self._generate_resolver_methods())
+
+        # on_start for setup (variables store, basic auth, login, etc.)
         on_start = self.scenario.get("on_start")
-        if isinstance(on_start, list) and on_start:
-            lines.extend(self._generate_on_start(on_start, base_headers))
-        
+        on_start_requests = on_start if isinstance(on_start, list) else []
+        if on_start_requests or basic_auth:
+            lines.extend(self._generate_on_start(on_start_requests, basic_auth))
+
         # Generate tasks
         for idx, req in enumerate(self.requests, start=1):
-            task_lines = self._generate_task(idx, req, base_headers)
+            task_lines = self._generate_task(idx, req)
             lines.extend(task_lines)
-        
+
         return lines
-    
-    def _generate_on_start(self, requests: List[Dict[str, Any]], base_headers: Dict[str, str]) -> List[str]:
+
+    def _build_request_call(self, req: Dict[str, Any]) -> str:
+        """Build the argument list for a self.client.request(...) call."""
+        method = str(req.get("method", "GET")).upper()
+        path = str(req.get("path"))
+        name = req.get("name") or f"{method} {path}"
+
+        # Resolve dynamic path segments at runtime, but keep the template
+        # string as the stats name so Locust groups all calls together.
+        if "${" in path:
+            path_expr = f"self._resolve({repr(path)})"
+        else:
+            path_expr = repr(path)
+
+        req_headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}
+        params = req.get("query") if isinstance(req.get("query"), dict) else None
+        json_body = req.get("json")
+        data_body = req.get("data")
+        timeout = req.get("timeout")
+
+        args: List[str] = [repr(method), path_expr]
+        kwargs: List[str] = [f"name={repr(name)}"]
+
+        if req_headers:
+            kwargs.append(
+                f"headers=self._resolve_dict({{**self._base_headers, **{repr(req_headers)}}})"
+            )
+        else:
+            kwargs.append("headers=self._resolve_dict(self._base_headers)")
+        if params:
+            kwargs.append(f"params=self._resolve_dict({repr(params)})")
+        if json_body is not None:
+            kwargs.append(f"json=self._resolve_dict({repr(json_body)})")
+        if data_body is not None:
+            kwargs.append(f"data=self._resolve_dict({repr(data_body)})")
+        if timeout is not None:
+            kwargs.append(f"timeout={repr(timeout)}")
+
+        return ", ".join(args + kwargs)
+
+    def _generate_on_start(
+        self,
+        requests: List[Dict[str, Any]],
+        basic_auth: Optional[Tuple[str, str]],
+    ) -> List[str]:
         """Generate on_start method for user initialization."""
         lines = [
             "",
             "    def on_start(self):",
             "        '''Run once per user at start (login, setup, etc.).'''",
+            "        self._vars = {}",
         ]
-        
+
+        if basic_auth:
+            user, password = basic_auth
+            lines.append("        self._base_headers = dict(self._base_headers)")
+            lines.append(
+                "        self._base_headers['Authorization'] = _basic_auth("
+                f"self._resolve({repr(user)}), self._resolve({repr(password)}))"
+            )
+
         for req in requests:
-            if not isinstance(req, dict):
-                continue
-            
-            method = str(req.get("method", "GET")).upper()
-            path = req.get("path")
-            if not path:
-                continue
-            
-            name = req.get("name") or f"{method} {path}"
-            
-            headers = base_headers.copy()
-            req_headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}
-            headers.update(req_headers)
-            
-            params = req.get("query")
-            json_body = req.get("json")
-            data_body = req.get("data")
-            
-            # Build call
-            args = [repr(method), repr(path)]
-            kwargs = [f"name={repr(name)}"]
-            if headers:
-                kwargs.append(f"headers=_resolve_dict({repr(headers)})")
-            if params:
-                kwargs.append(f"params=_resolve_dict({repr(params)})")
-            if json_body is not None:
-                kwargs.append(f"json=_resolve_dict({repr(json_body)})")
-            if data_body is not None:
-                kwargs.append(f"data=_resolve_dict({repr(data_body)})")
-            
-            # Handle response capture (for tokens, etc.)
+            call = self._build_request_call(req)
+
             capture = req.get("capture")
-            if capture:
-                lines.append(f"        resp = self.client.request({', '.join(args + kwargs)})")
-                if isinstance(capture, dict):
-                    for var_name, json_path in capture.items():
-                        # Simple json path like "token" or "data.access_token"
-                        lines.append(f"        try:")
-                        lines.append(f"            data = resp.json()")
-                        path_parts = json_path.split(".")
-                        accessor = "data"
-                        for part in path_parts:
-                            accessor += f"[{repr(part)}]"
-                        lines.append(f"            self.{var_name} = {accessor}")
-                        lines.append(f"        except Exception:")
-                        lines.append(f"            self.{var_name} = None")
+            if isinstance(capture, dict) and capture:
+                lines.append(f"        resp = self.client.request({call})")
+                for var_name, json_path in capture.items():
+                    # Simple json path like "token" or "data.access_token"
+                    accessor = "data"
+                    for part in str(json_path).split("."):
+                        accessor += f"[{repr(part)}]"
+                    lines.append("        try:")
+                    lines.append("            data = resp.json()")
+                    lines.append(f"            self._vars[{repr(str(var_name))}] = {accessor}")
+                    lines.append("        except Exception:")
+                    lines.append(f"            self._vars[{repr(str(var_name))}] = None")
             else:
-                lines.append(f"        self.client.request({', '.join(args + kwargs)})")
-        
+                lines.append(f"        self.client.request({call})")
+
         return lines
-    
-    def _generate_task(
-        self,
-        idx: int,
-        req: Dict[str, Any],
-        base_headers: Dict[str, str],
-    ) -> List[str]:
+
+    def _generate_task(self, idx: int, req: Dict[str, Any]) -> List[str]:
         """Generate a single task method."""
         method = str(req.get("method", "GET")).upper()
-        path = req.get("path")
-        if not path:
-            return []
-        
-        name = req.get("name") or f"{method} {path}"
+        path = str(req.get("path"))
         weight = _safe_int(req.get("weight"), 1)
         if weight < 1:
             weight = 1
-        
-        tags = req.get("tags", [])
-        
-        headers = base_headers.copy()
-        req_headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}
-        headers.update(req_headers)
-        
-        params = req.get("query") if isinstance(req.get("query"), dict) else None
-        json_body = req.get("json")
-        data_body = req.get("data")
-        timeout = req.get("timeout")
-        
-        # Build function arguments
-        args: List[str] = [repr(method), repr(path)]
-        kwargs: List[str] = [f"name={repr(name)}"]
-        
-        if headers:
-            kwargs.append(f"headers=_resolve_dict(self._base_headers | {repr(req_headers)})" if req_headers else "headers=_resolve_dict(self._base_headers)")
-        if params:
-            kwargs.append(f"params=_resolve_dict({repr(params)})")
-        if json_body is not None:
-            kwargs.append(f"json=_resolve_dict({repr(json_body)})")
-        if data_body is not None:
-            kwargs.append(f"data=_resolve_dict({repr(data_body)})")
-        if timeout is not None:
-            kwargs.append(f"timeout={repr(timeout)}")
-        
-        call = ", ".join(args + kwargs)
+
+        tags = req.get("tags") if isinstance(req.get("tags"), list) else []
+
+        call = self._build_request_call(req)
         func_name = _slugify(req.get("name") or f"{method}_{path}")
         func_name = f"task_{idx}_{func_name}"
-        
+
         lines = [""]
         for t in tags:
-            lines.append(f"    @tag('{t}')")
+            lines.append(f"    @tag({repr(str(t))})")
         lines.append(f"    @task({weight})")
         lines.append(f"    def {func_name}(self):")
         lines.append(f"        self.client.request({call})")
-        
+
         return lines
 
 
@@ -366,12 +424,12 @@ def generate_locustfile(
     output_dir: Path,
 ) -> Path:
     """Generate a locustfile from scenario configuration.
-    
+
     Args:
         scenario: The scenario configuration dict containing requests.
         target: The target/load configuration with host, headers, tags, etc.
         output_dir: Directory to write the generated file.
-    
+
     Returns:
         Path to the generated locustfile.
     """

@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from locomotive.config import _parse_env_ref, _resolve_env_value, load_config
+from locomotive.config import (
+    _collect_capture_names,
+    _parse_env_ref,
+    _resolve_env_value,
+    is_runtime_placeholder,
+    load_config,
+)
 
 
 # ── _parse_env_ref ────────────────────────────────────────────────────
@@ -92,3 +98,93 @@ class TestLoadConfig:
         config_path.write_text(json.dumps(config))
         result = load_config(config_path)
         assert result["locust"]["locustfile"] == "/absolute/path/test.py"
+
+
+# ── runtime placeholder preservation ──────────────────────────────────
+
+
+class TestRuntimePlaceholderPreservation:
+    def test_builtin_runtime_preserved(self):
+        value = "ts=${timestamp} r=${random} i=${iteration}"
+        assert _resolve_env_value(value) == value
+
+    def test_var_namespace_preserved(self, monkeypatch):
+        monkeypatch.setenv("order_id", "should-not-leak")
+        assert _resolve_env_value("/orders/${var:order_id}") == "/orders/${var:order_id}"
+
+    def test_data_namespace_preserved(self):
+        assert _resolve_env_value("${data:accounts.login}") == "${data:accounts.login}"
+
+    def test_captured_names_preserved(self, monkeypatch):
+        monkeypatch.setenv("auth_token", "should-not-leak")
+        value = "Bearer ${auth_token}"
+        assert _resolve_env_value(value, frozenset({"auth_token"})) == value
+
+    def test_uncaptured_name_still_resolved(self, monkeypatch):
+        monkeypatch.setenv("PLAIN", "resolved")
+        assert _resolve_env_value("${PLAIN}", frozenset({"auth_token"})) == "resolved"
+
+    def test_env_namespace_resolved_at_load(self, monkeypatch):
+        monkeypatch.setenv("MY_TOKEN", "xyz")
+        assert _resolve_env_value("${env:MY_TOKEN}") == "xyz"
+
+    def test_env_namespace_default(self, monkeypatch):
+        monkeypatch.delenv("UNSET_VAR", raising=False)
+        assert _resolve_env_value("${env:UNSET_VAR:-fallback}") == "fallback"
+
+
+class TestCollectCaptureNames:
+    def test_collects_from_on_start(self):
+        config = {
+            "scenario": {
+                "on_start": [
+                    {"path": "/login", "capture": {"auth_token": "data.token"}},
+                    {"path": "/profile", "capture": {"uid": "id", "org": "org.id"}},
+                ]
+            }
+        }
+        assert _collect_capture_names(config) == {"auth_token", "uid", "org"}
+
+    def test_empty_config(self):
+        assert _collect_capture_names({}) == set()
+
+    def test_capture_not_dict_ignored(self):
+        config = {"scenario": {"on_start": [{"path": "/x", "capture": "bad"}]}}
+        assert _collect_capture_names(config) == set()
+
+
+class TestIsRuntimePlaceholder:
+    @pytest.mark.parametrize("ref,expected", [
+        ("timestamp", True),
+        ("random", True),
+        ("iteration", True),
+        ("var:token", True),
+        ("data:accounts.login", True),
+        ("MY_VAR", False),
+        ("MY_VAR:-default", False),
+        ("env:MY_VAR", False),
+    ])
+    def test_refs(self, ref, expected):
+        assert is_runtime_placeholder(ref) is expected
+
+    def test_captured_name(self):
+        assert is_runtime_placeholder("auth_token", frozenset({"auth_token"})) is True
+
+
+class TestLoadConfigCapturePreservation:
+    def test_end_to_end(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("auth_token", raising=False)
+        config = {
+            "scenario": {
+                "headers": {"Authorization": "Bearer ${auth_token}"},
+                "on_start": [
+                    {"path": "/login", "capture": {"auth_token": "data.token"}}
+                ],
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }
+        }
+        config_path = tmp_path / "loconfig.json"
+        config_path.write_text(json.dumps(config))
+        result = load_config(config_path)
+        headers = result["scenario"]["headers"]
+        assert headers["Authorization"] == "Bearer ${auth_token}"
