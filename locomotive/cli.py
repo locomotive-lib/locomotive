@@ -155,14 +155,18 @@ def _maybe_generate_locustfile(
         return
     
     scenario = _get_section(config, "scenario")
-    if not scenario:
-        raise ValueError("Either 'locustfile' in load config or 'scenario' section is required")
-    
-    if not scenario.get("requests") and not scenario.get("flows"):
+    users = config.get("users")
+    users = users if isinstance(users, list) and users else None
+    if not scenario and not users:
+        raise ValueError(
+            "Either 'locustfile' in load config, or a 'scenario'/'users' section is required"
+        )
+
+    if not users and not scenario.get("requests") and not scenario.get("flows"):
         raise ValueError("scenario must define a non-empty 'requests' or 'flows' list")
-    
+
     output_dir = storage.run_dir(run_id) / "generated"
-    locustfile_path = generate_locustfile(scenario, locust_config, output_dir)
+    locustfile_path = generate_locustfile(scenario, locust_config, output_dir, users=users)
     locust_config["locustfile"] = str(locustfile_path)
 
 

@@ -833,3 +833,400 @@ class TestCaptureInFlatRequests:
         assert user._vars["first"] == "abc"
         user.task_2_use()
         assert user.client.calls[-1]["url"] == "/items/abc"
+
+
+# ── D1: data pools ────────────────────────────────────────────────────
+
+
+class TestDataPools:
+    def _inline_scenario(self, mode, rows=None):
+        return {
+            "data": {
+                "accounts": {
+                    "inline": rows or [
+                        {"login": "u1", "password": "p1"},
+                        {"login": "u2", "password": "p2"},
+                        {"login": "u3", "password": "p3"},
+                    ],
+                    "mode": mode,
+                }
+            },
+            "requests": [
+                {"name": "Login", "method": "POST", "path": "/login",
+                 "json": {"user": "${data:accounts.login}"}}
+            ],
+        }
+
+    def test_unique_per_user_distinct_rows(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("unique_per_user"))
+        users = []
+        for _ in range(3):
+            user = _make_user(ns)
+            user.on_start()
+            users.append(user)
+        logins = {u._data_rows["accounts"]["login"] for u in users}
+        assert logins == {"u1", "u2", "u3"}
+
+    def test_unique_per_user_wraps_when_exhausted(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("unique_per_user"))
+        users = []
+        for _ in range(4):
+            user = _make_user(ns)
+            user.on_start()
+            users.append(user)
+        # 4th user wraps around to the first row
+        assert users[3]._data_rows["accounts"]["login"] == "u1"
+
+    def test_once_same_row_for_everyone(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("once"))
+        logins = set()
+        for _ in range(3):
+            user = _make_user(ns)
+            user.on_start()
+            user.task_1_login()
+            logins.add(user.client.calls[-1]["json"]["user"])
+        assert logins == {"u1"}
+
+    def test_round_robin_cycles_per_access(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("round_robin"))
+        user = _make_user(ns)
+        user.on_start()
+        seen = []
+        for _ in range(4):
+            user.task_1_login()
+            seen.append(user.client.calls[-1]["json"]["user"])
+        assert seen == ["u1", "u2", "u3", "u1"]
+
+    def test_random_membership(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("random"))
+        user = _make_user(ns)
+        user.on_start()
+        for _ in range(10):
+            user.task_1_login()
+            assert user.client.calls[-1]["json"]["user"] in {"u1", "u2", "u3"}
+
+    def test_value_reaches_request_body(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._inline_scenario("unique_per_user"))
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_login()
+        assert user.client.calls[-1]["json"]["user"] == "u1"
+
+    def test_csv_source(self, tmp_path):
+        csv_path = tmp_path / "accounts.csv"
+        csv_path.write_text("login,password\ncsv1,x\ncsv2,y\n")
+        scenario = {
+            "data": {"accounts": {"source": str(csv_path), "mode": "unique_per_user"}},
+            "requests": [
+                {"name": "L", "method": "POST", "path": "/login",
+                 "json": {"user": "${data:accounts.login}"}}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_l()
+        assert user.client.calls[-1]["json"]["user"] == "csv1"
+
+    def test_json_source_with_nested_field(self, tmp_path):
+        import json as jsonlib
+        json_path = tmp_path / "accounts.json"
+        json_path.write_text(jsonlib.dumps(
+            [{"login": "j1", "profile": {"city": "Moscow"}}]
+        ))
+        scenario = {
+            "data": {"accounts": {"source": str(json_path), "mode": "once"}},
+            "requests": [
+                {"name": "L", "method": "GET",
+                 "path": "/city/${data:accounts.profile.city}"}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_l()
+        assert user.client.calls[-1]["url"] == "/city/Moscow"
+
+    def test_missing_pool_resolves_empty(self, tmp_path):
+        scenario = {
+            "requests": [
+                {"name": "L", "method": "GET", "path": "/x/${data:nope.field}"}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_l()
+        assert user.client.calls[-1]["url"] == "/x/"
+
+    def test_missing_field_resolves_empty(self, tmp_path):
+        ns = _exec_generated(
+            tmp_path,
+            {
+                "data": {"accounts": {"inline": [{"login": "u1"}], "mode": "once"}},
+                "requests": [
+                    {"name": "L", "method": "GET", "path": "/x/${data:accounts.nope}"}
+                ],
+            },
+        )
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_l()
+        assert user.client.calls[-1]["url"] == "/x/"
+
+    def test_missing_file_resolves_empty(self, tmp_path):
+        scenario = {
+            "data": {"accounts": {"source": str(tmp_path / "missing.csv")}},
+            "requests": [
+                {"name": "L", "method": "GET", "path": "/x/${data:accounts.login}"}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_l()
+        assert user.client.calls[-1]["url"] == "/x/"
+
+    def test_data_in_flow_steps(self, tmp_path):
+        scenario = {
+            "data": {"accounts": {"inline": [{"login": "flowuser"}], "mode": "once"}},
+            "flows": [
+                {"name": "F", "steps": [
+                    {"name": "S", "method": "POST", "path": "/login",
+                     "json": {"user": "${data:accounts.login}"}}
+                ]}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        flow = _make_flow(ns, "Flow_1_f", user)
+        flow.step_1_s()
+        assert user.client.calls[-1]["json"]["user"] == "flowuser"
+
+
+class TestDataPoolValidation:
+    def _gen(self, data):
+        return ScenarioGenerator(
+            {"data": data, "requests": [{"name": "P", "method": "GET", "path": "/p"}]},
+            {},
+        )
+
+    def test_bad_mode_raises(self, tmp_path):
+        gen = self._gen({"accounts": {"inline": [{"a": 1}], "mode": "weird"}})
+        with pytest.raises(ValueError, match="mode must be one of"):
+            gen.generate(tmp_path)
+
+    def test_no_source_no_inline_raises(self, tmp_path):
+        gen = self._gen({"accounts": {"mode": "random"}})
+        with pytest.raises(ValueError, match="'source'.*or 'inline'"):
+            gen.generate(tmp_path)
+
+    def test_bad_pool_name_raises(self, tmp_path):
+        gen = self._gen({"bad.name": {"inline": [{"a": 1}]}})
+        with pytest.raises(ValueError, match="pool name"):
+            gen.generate(tmp_path)
+
+    def test_inline_not_list_of_objects_raises(self, tmp_path):
+        gen = self._gen({"accounts": {"inline": ["not-a-dict"]}})
+        with pytest.raises(ValueError, match="list of objects"):
+            gen.generate(tmp_path)
+
+    def test_data_not_dict_raises(self, tmp_path):
+        gen = self._gen("bad")
+        with pytest.raises(ValueError, match="scenario.data must be an object"):
+            gen.generate(tmp_path)
+
+
+# ── personas (multiple user types) ────────────────────────────────────
+
+
+from locomotive.scenario import generate_locustfile
+
+
+def _generate_users(tmp_path, users, target=None):
+    path = generate_locustfile({}, target or {}, tmp_path, users=users)
+    content = path.read_text()
+    compile(content, str(path), "exec")
+    return content
+
+
+def _exec_users(tmp_path, users, target=None):
+    content = _generate_users(tmp_path, users, target)
+    import types as _t
+    # reuse the fake-locust exec machinery
+    scenario_stub = {"requests": [{"name": "x", "method": "GET", "path": "/x"}]}
+    ns_helper = _exec_generated  # for symmetry; we inline exec below
+
+    def fake_task(arg=1):
+        if callable(arg):
+            return arg
+        return lambda f: f
+
+    class FakeSequentialTaskSet:
+        def __init__(self, parent=None):
+            self.parent = parent
+            self.user = getattr(parent, "user", parent)
+            self.client = getattr(self.user, "client", None)
+            self.interrupted = False
+
+        def interrupt(self, reschedule=True):
+            self.interrupted = True
+
+    fake = _t.ModuleType("locust")
+    fake.HttpUser = type("HttpUser", (), {})
+    fake.SequentialTaskSet = FakeSequentialTaskSet
+    fake.task = fake_task
+    fake.tag = lambda *tags: (lambda f: f)
+    fake.between = lambda a, b: (a, b)
+
+    saved = sys.modules.get("locust")
+    sys.modules["locust"] = fake
+    try:
+        namespace = {}
+        exec(compile(content, "generated_locustfile.py", "exec"), namespace)
+    finally:
+        if saved is not None:
+            sys.modules["locust"] = saved
+        else:
+            sys.modules.pop("locust", None)
+    return namespace
+
+
+READER_BUYER = [
+    {
+        "weight": 4,
+        "name": "reader",
+        "scenario": {
+            "think_time": 0.5,
+            "headers": {"X-Persona": "reader"},
+            "requests": [{"name": "Read", "method": "GET", "path": "/articles"}],
+        },
+    },
+    {
+        "weight": 1,
+        "name": "buyer",
+        "scenario": {
+            "headers": {"X-Persona": "buyer"},
+            "flows": [
+                {"name": "Buy", "steps": [
+                    {"name": "Order", "method": "POST", "path": "/orders",
+                     "capture": {"oid": "id"}},
+                    {"name": "Pay", "method": "POST", "path": "/orders/${var:oid}/pay"},
+                ]}
+            ],
+        },
+    },
+]
+
+
+class TestPersonas:
+    def test_two_user_classes_with_weights(self, tmp_path):
+        content = _generate_users(tmp_path, READER_BUYER)
+        assert "class User_1_reader(_RuntimeMixin, HttpUser):" in content
+        assert "class User_2_buyer(_RuntimeMixin, HttpUser):" in content
+        reader_part = content[content.index("class User_1_reader"):content.index("class User_2_buyer")]
+        assert "weight = 4" in reader_part
+        buyer_part = content[content.index("class User_2_buyer"):]
+        assert "weight = 1" in buyer_part
+
+    def test_flow_prefix_no_collision(self, tmp_path):
+        content = _generate_users(tmp_path, READER_BUYER)
+        assert "class Flow2_1_buy(SequentialTaskSet):" in content
+        buyer_part = content[content.index("class User_2_buyer"):]
+        assert "tasks = {Flow2_1_buy: 1}" in buyer_part
+
+    def test_personas_have_isolated_settings(self, tmp_path):
+        ns = _exec_users(tmp_path, READER_BUYER)
+        reader = ns["User_1_reader"]()
+        buyer = ns["User_2_buyer"]()
+        assert reader._base_headers == {"X-Persona": "reader"}
+        assert buyer._base_headers == {"X-Persona": "buyer"}
+        assert reader.wait_time == (0.5, 0.5)
+
+    def test_personas_share_runtime_mixin(self, tmp_path):
+        ns = _exec_users(tmp_path, READER_BUYER)
+        # single mixin class, both users resolve placeholders
+        reader = ns["User_1_reader"]()
+        reader.client = StubClient()
+        reader._vars = {"k": "v"}
+        assert reader._resolve("${var:k}") == "v"
+        assert ns["User_1_reader"].__mro__[1] is ns["_RuntimeMixin"]
+        assert ns["User_2_buyer"].__mro__[1] is ns["_RuntimeMixin"]
+
+    def test_buyer_flow_chaining_works(self, tmp_path):
+        ns = _exec_users(tmp_path, READER_BUYER)
+        buyer = ns["User_2_buyer"]()
+        buyer.client = StubClient({"id": 9})
+        buyer.on_start()
+        flow = ns["Flow2_1_buy"](buyer)
+        flow.user = buyer
+        flow.client = buyer.client
+        flow.step_1_order()
+        flow.step_2_pay()
+        assert buyer.client.calls[-1]["url"] == "/orders/9/pay"
+
+    def test_flat_entry_form_without_scenario_key(self, tmp_path):
+        # Entry carries scenario fields directly (the "include" shape)
+        users = [
+            {"weight": 2, "name": "simple",
+             "requests": [{"name": "P", "method": "GET", "path": "/p"}]},
+        ]
+        content = _generate_users(tmp_path, users)
+        assert "class User_1_simple(_RuntimeMixin, HttpUser):" in content
+        assert "weight = 2" in content
+
+    def test_single_scenario_backward_compat(self, tmp_path):
+        # No users -> same GeneratedUser / Flow_1_x naming as before
+        scenario = {
+            "flows": [{"name": "F", "steps": [{"method": "GET", "path": "/x"}]}],
+        }
+        content = _generate(tmp_path, scenario)
+        assert "class GeneratedUser(_RuntimeMixin, HttpUser):" in content
+        assert "class Flow_1_f(SequentialTaskSet):" in content
+        assert "weight =" not in content.split("class GeneratedUser")[1].split("wait_time")[0]
+
+    def test_persona_validation_error_names_persona(self, tmp_path):
+        users = [{"weight": 1, "name": "bad", "scenario": {}}]
+        with pytest.raises(ValueError, match=r"users\[1\]"):
+            generate_locustfile({}, {}, tmp_path, users=users)
+
+    def test_persona_not_dict_raises(self, tmp_path):
+        with pytest.raises(ValueError, match=r"users\[2\] must be an object"):
+            generate_locustfile({}, {}, tmp_path, users=[
+                {"weight": 1, "scenario": {"requests": [{"method": "GET", "path": "/x"}]}},
+                "oops",
+            ])
+
+
+class TestPersonaDataPools:
+    def test_shared_identical_pool_merged(self, tmp_path):
+        pool = {"inline": [{"login": "u1"}], "mode": "once"}
+        users = [
+            {"weight": 1, "scenario": {
+                "data": {"accounts": dict(pool)},
+                "requests": [{"name": "A", "method": "POST", "path": "/a",
+                              "json": {"u": "${data:accounts.login}"}}]}},
+            {"weight": 1, "scenario": {
+                "data": {"accounts": dict(pool)},
+                "requests": [{"name": "B", "method": "POST", "path": "/b",
+                              "json": {"u": "${data:accounts.login}"}}]}},
+        ]
+        ns = _exec_users(tmp_path, users)
+        u1 = ns["User_1_user_1"]()
+        u1.client = StubClient()
+        u1.on_start()
+        u1.task_1_a()
+        assert u1.client.calls[-1]["json"]["u"] == "u1"
+
+    def test_conflicting_pool_definitions_raise(self, tmp_path):
+        users = [
+            {"weight": 1, "scenario": {
+                "data": {"accounts": {"inline": [{"a": "1"}], "mode": "once"}},
+                "requests": [{"name": "A", "method": "GET", "path": "/a"}]}},
+            {"weight": 1, "scenario": {
+                "data": {"accounts": {"inline": [{"a": "2"}], "mode": "once"}},
+                "requests": [{"name": "B", "method": "GET", "path": "/b"}]}},
+        ]
+        with pytest.raises(ValueError, match="defined differently"):
+            generate_locustfile({}, {}, tmp_path, users=users)

@@ -110,6 +110,13 @@ def _resolve_paths(config: Dict[str, Any], base_dir: Path) -> Dict[str, Any]:
     report = config.get("report")
     if isinstance(report, dict) and "output" in report:
         report["output"] = _resolve_path(base_dir, report["output"])
+    scenario = config.get("scenario")
+    if isinstance(scenario, dict):
+        data = scenario.get("data")
+        if isinstance(data, dict):
+            for pool in data.values():
+                if isinstance(pool, dict) and "source" in pool:
+                    pool["source"] = _resolve_path(base_dir, pool["source"])
     return config
 
 
@@ -126,11 +133,59 @@ def _load_data_file(path: Path) -> Dict[str, Any]:
     return data or {}
 
 
+_MAX_INCLUDE_DEPTH = 10
+
+
+def _process_includes(node: Any, base_dir: Path, depth: int = 0) -> Any:
+    """Recursively expand "include" directives.
+
+    A dict node {"include": "personas/reader.yaml", ...other} is replaced by
+    the included file's content merged with the sibling keys — sibling keys
+    win. Included files may include further files (paths are relative to the
+    file that contains the directive). Runs BEFORE placeholder resolution so
+    included capture names are preserved correctly.
+    """
+    if depth > _MAX_INCLUDE_DEPTH:
+        raise ValueError(
+            f"include nesting deeper than {_MAX_INCLUDE_DEPTH} levels "
+            "(possible include cycle)"
+        )
+    if isinstance(node, dict):
+        include_ref = node.get("include")
+        if isinstance(include_ref, str) and include_ref.strip():
+            include_path = Path(include_ref)
+            if not include_path.is_absolute():
+                include_path = (base_dir / include_path).resolve()
+            if not include_path.exists():
+                raise ValueError(f"Included file not found: {include_path}")
+            content = _load_data_file(include_path)
+            content = _process_includes(content, include_path.parent, depth + 1)
+            if not isinstance(content, dict):
+                raise ValueError(
+                    f"Included file must contain an object, got "
+                    f"{type(content).__name__}: {include_path}"
+                )
+            rest = {
+                key: _process_includes(value, base_dir, depth)
+                for key, value in node.items()
+                if key != "include"
+            }
+            return {**content, **rest}
+        return {
+            key: _process_includes(value, base_dir, depth)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_process_includes(item, base_dir, depth) for item in node]
+    return node
+
+
 def load_config(path: Union[str, Path]) -> Dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     data = _load_data_file(config_path)
+    data = _process_includes(data, config_path.parent)
     capture_names = frozenset(_collect_capture_names(data))
     data = _resolve_env_value(data, capture_names)
     return _resolve_paths(data, config_path.parent)

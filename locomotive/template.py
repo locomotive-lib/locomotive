@@ -196,6 +196,13 @@ def generate_template(
                     }
                 }
             ],
+            "_data_example": {
+                "_comment": "Rename to 'data' for data-driven values: ${data:accounts.login}",
+                "accounts": {
+                    "source": "data/accounts.csv",
+                    "mode": "unique_per_user"
+                }
+            },
             "_flows_example": [
                 {
                     "_comment": "Rename to 'flows' for ordered multi-step journeys; captured vars chain between steps",

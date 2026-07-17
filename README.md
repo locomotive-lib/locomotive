@@ -288,6 +288,128 @@ How it works:
 - Variables captured in a step are stored per virtual user and are visible in later steps, in other flows, and in flat requests.
 - Flow-level `tags` participate in `--tags` / `--exclude-tags` filtering, same as request tags.
 
+## Data pools (data-driven testing)
+
+Data pools feed requests with rows from CSV/JSON files (or inline lists) — e.g. a pool of test accounts where each virtual user logs in with its own credentials:
+
+```jsonc
+{
+  "scenario": {
+    "data": {
+      "accounts": {
+        "source": "data/accounts.csv",      // CSV (with header) or .json (array of objects)
+        "mode": "unique_per_user"           // see modes below
+      },
+      "products": {
+        "inline": [                          // alternative: rows right in the config
+          {"id": "1", "sku": "A-100"},
+          {"id": "2", "sku": "B-200"}
+        ],
+        "mode": "random"
+      }
+    },
+    "on_start": [
+      {
+        "name": "Login",
+        "method": "POST",
+        "path": "/auth/login",
+        "json": {
+          "username": "${data:accounts.login}",     // this user's row
+          "password": "${data:accounts.password}"
+        },
+        "capture": {"auth_token": "token"}
+      }
+    ],
+    "requests": [
+      {"name": "Buy", "method": "POST", "path": "/buy",
+       "json": {"sku": "${data:products.sku}"}}
+    ]
+  }
+}
+```
+
+`${data:pool.field}` resolves a field of a row; nested JSON fields use dot paths (`${data:accounts.profile.city}`).
+
+| Mode | Row selection |
+|------|---------------|
+| `unique_per_user` (default) | Each virtual user pins its own row at start; consistent across all of that user's requests. Wraps around when users outnumber rows. |
+| `round_robin` | Every access takes the next row, cycling through the pool |
+| `random` | Every access takes a random row |
+| `once` | The first row is used for the entire run |
+
+Notes:
+
+- `source` paths are relative to the config file. Files are read once per worker process at startup.
+- A missing pool, field, or file resolves to an empty string (the run does not crash); check generated requests if values come out empty.
+- In distributed mode, row uniqueness for `unique_per_user` is per worker process — two workers may hand out the same row. Split the file between workers if strict global uniqueness matters.
+
+## Personas (multiple user types)
+
+The top-level `users` section defines several user types running simultaneously — e.g. 80% readers and 20% buyers. Each persona is a full `scenario` of its own (think_time, headers, auth, data, flows, requests) with a scheduling weight:
+
+```jsonc
+{
+  "load": { "host": "...", "users": 100, "spawn_rate": 10, "run_time": "3m" },
+  "users": [
+    {
+      "weight": 4,                          // 4 of every 5 virtual users
+      "name": "reader",
+      "scenario": {
+        "think_time": {"min": 1.0, "max": 3.0},
+        "requests": [
+          {"name": "Read article", "method": "GET", "path": "/articles/${randint:1:1000}"}
+        ]
+      }
+    },
+    {
+      "weight": 1,                          // 1 of every 5 virtual users
+      "name": "buyer",
+      "scenario": {
+        "auth": {"type": "bearer", "token": "${API_TOKEN}"},
+        "flows": [
+          {"name": "Checkout", "steps": [
+            {"name": "Order", "method": "POST", "path": "/orders", "capture": {"order_id": "id"}},
+            {"name": "Pay", "method": "POST", "path": "/orders/${var:order_id}/pay"}
+          ]}
+        ]
+      }
+    }
+  ]
+}
+```
+
+Each persona becomes its own Locust user class; Locust distributes virtual users between classes by `weight`. Settings are fully isolated per persona (headers, auth, think_time, on_start/on_stop). Data pool names are global across personas — share one definition or use distinct names. When `users` is present, the top-level `scenario` section is ignored.
+
+## Modular configs (`include`)
+
+Any object in the config may use `include` to pull in another JSON/YAML file — the classic use case is one file per persona:
+
+```jsonc
+// loconfig.json
+{
+  "load": { "host": "https://staging.myapp.com", "users": 100, "spawn_rate": 10, "run_time": "3m" },
+  "users": [
+    {"weight": 4, "name": "reader", "include": "personas/reader.json"},
+    {"weight": 1, "name": "buyer",  "include": "personas/buyer.json"}
+  ]
+}
+
+// personas/reader.json
+{
+  "scenario": {
+    "think_time": {"min": 1.0, "max": 3.0},
+    "requests": [{"name": "Read", "method": "GET", "path": "/articles"}]
+  }
+}
+```
+
+Rules:
+
+- The included file's content is merged into the object containing `include`; sibling keys (like `weight` above) win over included ones.
+- Paths are relative to the file containing the directive, so included files can include further files (`personas/reader.json` can `include` `shared_headers.json` next to it). Cycles are detected and reported.
+- Includes are expanded before placeholder resolution — `capture` variables defined in included files work exactly as if written inline.
+- Any object works, not just personas: share a common `data` pool, a headers block, or gate thresholds between configs.
+
 ## Rules vs Gates
 
 Locomotive provides two mechanisms for validating metrics:

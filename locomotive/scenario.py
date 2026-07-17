@@ -17,6 +17,11 @@ RUNTIME_FUNCTIONS = frozenset(
     {"timestamp", "random", "iteration", "uuid", "randint", "choice", "now"}
 )
 
+# Allowed data pool selection modes (scenario.data.<pool>.mode)
+DATA_MODES = frozenset({"unique_per_user", "round_robin", "random", "once"})
+
+_POOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
 
 def _slugify(value: str) -> str:
     value = value.strip().lower()
@@ -39,8 +44,258 @@ def _safe_float(value: Any, default: float) -> float:
         return default
 
 
+# ── module-level emitters (shared by all personas) ────────────────────
+
+
+def _emit_imports() -> List[str]:
+    """Generate import statements."""
+    return [
+        "import base64",
+        "import csv",
+        "import json",
+        "import os",
+        "import re",
+        "import threading",
+        "import time",
+        "import random",
+        "import uuid",
+        "from locust import HttpUser, SequentialTaskSet, task, between, tag",
+        "",
+    ]
+
+
+def _emit_helpers() -> List[str]:
+    """Generate module-level helper functions for dynamic values."""
+    return [
+        "",
+        "# Dynamic value generators",
+        "_iteration_counter = 0",
+        "",
+        "_PLACEHOLDER_RE = re.compile(r'\\$\\{([^}]+)\\}')",
+        "",
+        "",
+        "def _timestamp():",
+        "    '''Current timestamp in milliseconds.'''",
+        "    return str(int(time.time() * 1000))",
+        "",
+        "",
+        "def _random_string(length=8):",
+        "    '''Random alphanumeric string.'''",
+        "    chars = 'abcdefghijklmnopqrstuvwxyz0123456789'",
+        "    return ''.join(random.choice(chars) for _ in range(length))",
+        "",
+        "",
+        "def _iteration():",
+        "    '''Incrementing counter.'''",
+        "    global _iteration_counter",
+        "    _iteration_counter += 1",
+        "    return _iteration_counter",
+        "",
+        "",
+        "def _basic_auth(username, password):",
+        "    '''Build a base64-encoded Basic Authorization header value.'''",
+        "    raw = f'{username}:{password}'.encode('utf-8')",
+        "    return 'Basic ' + base64.b64encode(raw).decode('ascii')",
+        "",
+        "",
+        "def _parse_env_ref(ref):",
+        "    '''Split a VAR:-default (or VAR:default) reference into (name, default).'''",
+        "    if ':-' in ref:",
+        "        name, default = ref.split(':-', 1)",
+        "        return name, default",
+        "    if ':' in ref:",
+        "        name, default = ref.split(':', 1)",
+        "        return name, default",
+        "    return ref, ''",
+        "",
+        "",
+        f"_RUNTIME_FUNCTIONS = frozenset({sorted(RUNTIME_FUNCTIONS)!r})",
+        "",
+        "",
+        "def _call_function(name, args):",
+        "    '''Dispatch a ${func:args} runtime placeholder.",
+        "",
+        "    Argument errors degrade gracefully (defaults or empty string)",
+        "    instead of crashing the load test.",
+        "    '''",
+        "    if name == 'timestamp':",
+        "        return _timestamp()",
+        "    if name == 'iteration':",
+        "        return str(_iteration())",
+        "    if name == 'uuid':",
+        "        return str(uuid.uuid4())",
+        "    if name == 'random':",
+        "        try:",
+        "            length = int(args) if args else 8",
+        "        except ValueError:",
+        "            length = 8",
+        "        return _random_string(max(1, length))",
+        "    if name == 'randint':",
+        "        lo, _, hi = args.partition(':')",
+        "        try:",
+        "            a, b = int(lo), int(hi)",
+        "        except ValueError:",
+        "            return ''",
+        "        if a > b:",
+        "            a, b = b, a",
+        "        return str(random.randint(a, b))",
+        "    if name == 'choice':",
+        "        options = [item for item in args.split(',') if item != '']",
+        "        return random.choice(options) if options else ''",
+        "    if name == 'now':",
+        "        try:",
+        "            return time.strftime(args or '%Y-%m-%dT%H:%M:%S')",
+        "        except ValueError:",
+        "            return time.strftime('%Y-%m-%dT%H:%M:%S')",
+        "    return ''",
+        "",
+    ]
+
+
+def _emit_data_layer(data_specs: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Generate the data pool machinery (specs, lazy loader, counters)."""
+    return [
+        "",
+        "# Data pools (${data:pool.field})",
+        f"_DATA_SPECS = {repr(data_specs)}",
+        "_DATA_POOLS = {}",
+        "_DATA_COUNTERS = {}",
+        "_DATA_LOCK = threading.Lock()",
+        "",
+        "",
+        "def _load_pool(name):",
+        "    '''Load a data pool once per process (CSV/JSON file or inline rows).'''",
+        "    if name in _DATA_POOLS:",
+        "        return _DATA_POOLS[name]",
+        "    with _DATA_LOCK:",
+        "        if name in _DATA_POOLS:",
+        "            return _DATA_POOLS[name]",
+        "        spec = _DATA_SPECS.get(name) or {}",
+        "        rows = []",
+        "        if spec.get('inline') is not None:",
+        "            rows = [row for row in spec['inline'] if isinstance(row, dict)]",
+        "        else:",
+        "            path = spec.get('source') or ''",
+        "            try:",
+        "                if path.lower().endswith('.json'):",
+        "                    with open(path, encoding='utf-8') as handle:",
+        "                        data = json.load(handle)",
+        "                    if isinstance(data, list):",
+        "                        rows = [row for row in data if isinstance(row, dict)]",
+        "                else:",
+        "                    with open(path, newline='', encoding='utf-8') as handle:",
+        "                        rows = list(csv.DictReader(handle))",
+        "            except (OSError, ValueError):",
+        "                rows = []",
+        "        _DATA_POOLS[name] = rows",
+        "        return rows",
+        "",
+        "",
+        "def _next_index(counter_key, size):",
+        "    '''Thread-safe cycling counter (wraps around when exhausted).'''",
+        "    with _DATA_LOCK:",
+        "        idx = _DATA_COUNTERS.get(counter_key, 0)",
+        "        _DATA_COUNTERS[counter_key] = idx + 1",
+        "    return idx % size",
+        "",
+    ]
+
+
+def _emit_runtime_mixin() -> List[str]:
+    """Generate the mixin with the placeholder resolver, shared by all users."""
+    return [
+        "",
+        "",
+        "class _RuntimeMixin:",
+        "    '''Placeholder resolution shared by all generated user classes.'''",
+        "",
+        "    def _resolve(self, value):",
+        "        '''Resolve dynamic placeholders in string values.",
+        "",
+        "        Supports:",
+        "            ${var:name}         - captured variable (see \"capture\")",
+        "            ${env:NAME}         - environment variable",
+        "            ${env:NAME:-def}    - environment variable with default",
+        "            ${data:pool.field}  - field of this user's data pool row",
+        "            ${NAME}             - captured variable, then env variable",
+        "            ${timestamp}        - current timestamp ms",
+        "            ${random}           - random string (${random:N} for length N)",
+        "            ${iteration}        - incrementing counter",
+        "            ${uuid}             - random UUID4",
+        "            ${randint:A:B}      - random integer between A and B",
+        "            ${choice:a,b,c}     - random element of a comma-separated list",
+        "            ${now:%Y-%m-%d}     - current time via strftime (default ISO)",
+        "        '''",
+        "        if not isinstance(value, str):",
+        "            return value",
+        "",
+        "        def replace(match):",
+        "            key = match.group(1)",
+        "            if key.startswith('var:'):",
+        "                variables = getattr(self, '_vars', {})",
+        "                found = variables.get(key[4:])",
+        "                return '' if found is None else str(found)",
+        "            if key.startswith('env:'):",
+        "                name, default = _parse_env_ref(key[4:])",
+        "                return os.environ.get(name, default)",
+        "            if key.startswith('data:'):",
+        "                pool_name, _, field_path = key[5:].partition('.')",
+        "                return self._data_value(pool_name, field_path)",
+        "            func_name, _, func_args = key.partition(':')",
+        "            if func_name in _RUNTIME_FUNCTIONS:",
+        "                return _call_function(func_name, func_args)",
+        "            variables = getattr(self, '_vars', {})",
+        "            name, default = _parse_env_ref(key)",
+        "            if name in variables:",
+        "                found = variables[name]",
+        "                return '' if found is None else str(found)",
+        "            return os.environ.get(name, default)",
+        "",
+        "        return _PLACEHOLDER_RE.sub(replace, value)",
+        "",
+        "    def _resolve_dict(self, d):",
+        "        '''Recursively resolve dynamic values in dict/list.'''",
+        "        if isinstance(d, dict):",
+        "            return {k: self._resolve_dict(v) for k, v in d.items()}",
+        "        if isinstance(d, list):",
+        "            return [self._resolve_dict(v) for v in d]",
+        "        return self._resolve(d)",
+        "",
+        "    def _data_value(self, pool_name, field_path):",
+        "        '''Resolve ${data:pool.field} for this user.'''",
+        "        rows = _load_pool(pool_name)",
+        "        if not rows:",
+        "            return ''",
+        "        spec = _DATA_SPECS.get(pool_name) or {}",
+        "        mode = spec.get('mode', 'unique_per_user')",
+        "        if mode == 'random':",
+        "            row = random.choice(rows)",
+        "        elif mode == 'round_robin':",
+        "            row = rows[_next_index(pool_name + ':access', len(rows))]",
+        "        else:",
+        "            data_rows = getattr(self, '_data_rows', None)",
+        "            if data_rows is None:",
+        "                data_rows = self._data_rows = {}",
+        "            row = data_rows.get(pool_name)",
+        "            if row is None:",
+        "                if mode == 'once':",
+        "                    row = rows[0]",
+        "                else:  # unique_per_user",
+        "                    row = rows[_next_index(pool_name, len(rows))]",
+        "                data_rows[pool_name] = row",
+        "        value = row",
+        "        for part in field_path.split('.'):",
+        "            if isinstance(value, dict):",
+        "                value = value.get(part)",
+        "            else:",
+        "                value = None",
+        "                break",
+        "        return '' if value is None else str(value)",
+    ]
+
+
 class ScenarioGenerator:
-    """Generates Locust test files from scenario configuration.
+    """Generates Locust user classes from scenario configuration.
 
     The scenario config format:
     {
@@ -49,6 +304,12 @@ class ScenarioGenerator:
         "auth": {
             "type": "bearer",
             "token": "${API_TOKEN}"
+        },
+        "data": {  # data pools for data-driven values
+            "accounts": {
+                "source": "data/accounts.csv",   # CSV/JSON file, or "inline": [{...}]
+                "mode": "unique_per_user"        # round_robin | random | once
+            }
         },
         "on_start": [  # requests to run once per user at start
             {"method": "POST", "path": "/login",
@@ -89,20 +350,33 @@ class ScenarioGenerator:
     Placeholder namespaces resolved at runtime by the generated file:
         ${var:name}   - variable captured via "capture"
         ${env:NAME}   - environment variable (also ${env:NAME:-default})
+        ${data:pool.field} - field of the user's row from a data pool
         ${NAME}       - captured variable first, then environment variable
         ${timestamp}, ${random[:N]}, ${iteration}, ${uuid},
         ${randint:A:B}, ${choice:a,b,c}, ${now:fmt} - built-in generators
+
+    Multiple personas: see generate_locustfile(users=...). Each persona is an
+    independent scenario rendered as its own HttpUser class with a weight.
     """
 
     def __init__(
         self,
         scenario: Dict[str, Any],
         target: Dict[str, Any],
+        class_name: str = "GeneratedUser",
+        weight: Optional[int] = None,
+        flow_prefix: str = "Flow",
+        section_prefix: str = "scenario",
     ) -> None:
         self.scenario = scenario
         self.target = target
+        self.class_name = class_name
+        self.weight = weight
+        self.flow_prefix = flow_prefix
+        self.section_prefix = section_prefix
         self.requests: List[Dict[str, Any]] = []
         self.flows: List[Dict[str, Any]] = []
+        self.data_specs: Dict[str, Dict[str, Any]] = {}
 
     def _filter_by_tags(self, items: List[Any]) -> List[Any]:
         """Filter requests/flows by target include/exclude tags."""
@@ -138,38 +412,84 @@ class ScenarioGenerator:
             flows = []
         self.flows = self._filter_by_tags(flows)
 
-    def generate(self, output_dir: Path) -> Path:
-        """Generate the locustfile and return its path."""
+    def load_data_specs(self) -> None:
+        """Load and validate data pool specs from config."""
+        data = self.scenario.get("data")
+        if data is None:
+            self.data_specs = {}
+            return
+        if not isinstance(data, dict):
+            raise ValueError(f"{self.section_prefix}.data must be an object of pool specs")
+
+        specs: Dict[str, Dict[str, Any]] = {}
+        for name, spec in data.items():
+            pool_name = str(name)
+            if not _POOL_NAME_RE.match(pool_name):
+                raise ValueError(
+                    f"{self.section_prefix}.data pool name {pool_name!r} must match [A-Za-z0-9_]+"
+                )
+            if not isinstance(spec, dict):
+                raise ValueError(
+                    f"{self.section_prefix}.data.{pool_name} must be an object, got {type(spec).__name__}"
+                )
+            source = spec.get("source")
+            inline = spec.get("inline")
+            if inline is not None:
+                if not isinstance(inline, list) or not all(
+                    isinstance(row, dict) for row in inline
+                ):
+                    raise ValueError(
+                        f"{self.section_prefix}.data.{pool_name}.inline must be a list of objects"
+                    )
+            elif not (isinstance(source, str) and source.strip()):
+                raise ValueError(
+                    f"{self.section_prefix}.data.{pool_name} must define 'source' (file path) or 'inline' (rows)"
+                )
+            mode = str(spec.get("mode", "unique_per_user"))
+            if mode not in DATA_MODES:
+                raise ValueError(
+                    f"{self.section_prefix}.data.{pool_name}.mode must be one of "
+                    f"{sorted(DATA_MODES)}, got {mode!r}"
+                )
+            specs[pool_name] = {
+                "source": source if isinstance(source, str) else None,
+                "inline": inline,
+                "mode": mode,
+            }
+        self.data_specs = specs
+
+    def prepare(self) -> None:
+        """Load and validate all scenario pieces. Must run before emit_classes."""
         self.load_requests()
         self.load_flows()
+        self.load_data_specs()
 
         if not self.requests and not self.flows:
             raise ValueError(
-                "scenario must define a non-empty 'requests' or 'flows' list"
+                f"{self.section_prefix} must define a non-empty 'requests' or 'flows' list"
             )
 
-        self._validate_requests(self.requests, "scenario.requests")
+        self._validate_requests(self.requests, f"{self.section_prefix}.requests")
         self._validate_flows(self.flows)
         for section in ("on_start", "on_stop"):
             entries = self.scenario.get(section)
             if isinstance(entries, list):
-                self._validate_requests(entries, f"scenario.{section}")
+                self._validate_requests(entries, f"{self.section_prefix}.{section}")
 
-        lines = self._generate_imports()
-        lines.extend(self._generate_helpers())
-
+    def emit_classes(self) -> List[str]:
+        """Emit flow classes and the user class for this persona."""
+        lines: List[str] = []
         flow_entries: List[Tuple[str, int]] = []
         for idx, flow in enumerate(self.flows, start=1):
             class_name, weight, flow_lines = self._generate_flow_class(idx, flow)
             flow_entries.append((class_name, weight))
             lines.extend(flow_lines)
-
         lines.extend(self._generate_user_class(flow_entries))
+        return lines
 
-        output_path = output_dir / "generated_locustfile.py"
-        ensure_dir(output_dir)
-        write_text(output_path, "\n".join(lines) + "\n")
-        return output_path
+    def generate(self, output_dir: Path) -> Path:
+        """Generate a complete locustfile for this single scenario."""
+        return _write_locustfile([self], output_dir)
 
     @staticmethod
     def _validate_requests(requests: List[Any], section: str) -> None:
@@ -190,169 +510,15 @@ class ScenarioGenerator:
         for idx, flow in enumerate(flows, start=1):
             if not isinstance(flow, dict):
                 raise ValueError(
-                    f"scenario.flows[{idx}] must be an object, got {type(flow).__name__}"
+                    f"{self.section_prefix}.flows[{idx}] must be an object, got {type(flow).__name__}"
                 )
             label = flow.get("name") or f"flow_{idx}"
             steps = flow.get("steps")
             if not isinstance(steps, list) or not steps:
                 raise ValueError(
-                    f"scenario.flows[{idx}] ({label!r}) must define a non-empty 'steps' list"
+                    f"{self.section_prefix}.flows[{idx}] ({label!r}) must define a non-empty 'steps' list"
                 )
-            self._validate_requests(steps, f"scenario.flows[{idx}].steps")
-
-    def _generate_imports(self) -> List[str]:
-        """Generate import statements."""
-        return [
-            "import base64",
-            "import os",
-            "import re",
-            "import time",
-            "import random",
-            "import uuid",
-            "from locust import HttpUser, SequentialTaskSet, task, between, tag",
-            "",
-        ]
-
-    def _generate_helpers(self) -> List[str]:
-        """Generate module-level helper functions for dynamic values."""
-        return [
-            "",
-            "# Dynamic value generators",
-            "_iteration_counter = 0",
-            "",
-            "_PLACEHOLDER_RE = re.compile(r'\\$\\{([^}]+)\\}')",
-            "",
-            "",
-            "def _timestamp():",
-            "    '''Current timestamp in milliseconds.'''",
-            "    return str(int(time.time() * 1000))",
-            "",
-            "",
-            "def _random_string(length=8):",
-            "    '''Random alphanumeric string.'''",
-            "    chars = 'abcdefghijklmnopqrstuvwxyz0123456789'",
-            "    return ''.join(random.choice(chars) for _ in range(length))",
-            "",
-            "",
-            "def _iteration():",
-            "    '''Incrementing counter.'''",
-            "    global _iteration_counter",
-            "    _iteration_counter += 1",
-            "    return _iteration_counter",
-            "",
-            "",
-            "def _basic_auth(username, password):",
-            "    '''Build a base64-encoded Basic Authorization header value.'''",
-            "    raw = f'{username}:{password}'.encode('utf-8')",
-            "    return 'Basic ' + base64.b64encode(raw).decode('ascii')",
-            "",
-            "",
-            "def _parse_env_ref(ref):",
-            "    '''Split a VAR:-default (or VAR:default) reference into (name, default).'''",
-            "    if ':-' in ref:",
-            "        name, default = ref.split(':-', 1)",
-            "        return name, default",
-            "    if ':' in ref:",
-            "        name, default = ref.split(':', 1)",
-            "        return name, default",
-            "    return ref, ''",
-            "",
-            "",
-            f"_RUNTIME_FUNCTIONS = frozenset({sorted(RUNTIME_FUNCTIONS)!r})",
-            "",
-            "",
-            "def _call_function(name, args):",
-            "    '''Dispatch a ${func:args} runtime placeholder.",
-            "",
-            "    Argument errors degrade gracefully (defaults or empty string)",
-            "    instead of crashing the load test.",
-            "    '''",
-            "    if name == 'timestamp':",
-            "        return _timestamp()",
-            "    if name == 'iteration':",
-            "        return str(_iteration())",
-            "    if name == 'uuid':",
-            "        return str(uuid.uuid4())",
-            "    if name == 'random':",
-            "        try:",
-            "            length = int(args) if args else 8",
-            "        except ValueError:",
-            "            length = 8",
-            "        return _random_string(max(1, length))",
-            "    if name == 'randint':",
-            "        lo, _, hi = args.partition(':')",
-            "        try:",
-            "            a, b = int(lo), int(hi)",
-            "        except ValueError:",
-            "            return ''",
-            "        if a > b:",
-            "            a, b = b, a",
-            "        return str(random.randint(a, b))",
-            "    if name == 'choice':",
-            "        options = [item for item in args.split(',') if item != '']",
-            "        return random.choice(options) if options else ''",
-            "    if name == 'now':",
-            "        try:",
-            "            return time.strftime(args or '%Y-%m-%dT%H:%M:%S')",
-            "        except ValueError:",
-            "            return time.strftime('%Y-%m-%dT%H:%M:%S')",
-            "    return ''",
-            "",
-        ]
-
-    def _generate_resolver_methods(self) -> List[str]:
-        """Generate the instance-bound placeholder resolver."""
-        return [
-            "",
-            "    def _resolve(self, value):",
-            "        '''Resolve dynamic placeholders in string values.",
-            "",
-            "        Supports:",
-            "            ${var:name}         - captured variable (see \"capture\")",
-            "            ${env:NAME}         - environment variable",
-            "            ${env:NAME:-def}    - environment variable with default",
-            "            ${NAME}             - captured variable, then env variable",
-            "            ${timestamp}        - current timestamp ms",
-            "            ${random}           - random string (${random:N} for length N)",
-            "            ${iteration}        - incrementing counter",
-            "            ${uuid}             - random UUID4",
-            "            ${randint:A:B}      - random integer between A and B",
-            "            ${choice:a,b,c}     - random element of a comma-separated list",
-            "            ${now:%Y-%m-%d}     - current time via strftime (default ISO)",
-            "        '''",
-            "        if not isinstance(value, str):",
-            "            return value",
-            "",
-            "        def replace(match):",
-            "            key = match.group(1)",
-            "            if key.startswith('var:'):",
-            "                variables = getattr(self, '_vars', {})",
-            "                found = variables.get(key[4:])",
-            "                return '' if found is None else str(found)",
-            "            if key.startswith('env:'):",
-            "                name, default = _parse_env_ref(key[4:])",
-            "                return os.environ.get(name, default)",
-            "            func_name, _, func_args = key.partition(':')",
-            "            if func_name in _RUNTIME_FUNCTIONS:",
-            "                return _call_function(func_name, func_args)",
-            "            variables = getattr(self, '_vars', {})",
-            "            name, default = _parse_env_ref(key)",
-            "            if name in variables:",
-            "                found = variables[name]",
-            "                return '' if found is None else str(found)",
-            "            return os.environ.get(name, default)",
-            "",
-            "        return _PLACEHOLDER_RE.sub(replace, value)",
-            "",
-            "    def _resolve_dict(self, d):",
-            "        '''Recursively resolve dynamic values in dict/list.'''",
-            "        if isinstance(d, dict):",
-            "            return {k: self._resolve_dict(v) for k, v in d.items()}",
-            "        if isinstance(d, list):",
-            "            return [self._resolve_dict(v) for v in d]",
-            "        return self._resolve(d)",
-            "",
-        ]
+            self._validate_requests(steps, f"{self.section_prefix}.flows[{idx}].steps")
 
     def _auth_config(self, base_headers: Dict[str, str]) -> Optional[Tuple[str, str]]:
         """Apply auth config to base headers.
@@ -470,7 +636,7 @@ class ScenarioGenerator:
         Returns (class_name, weight, lines).
         """
         name = str(flow.get("name") or f"flow_{idx}")
-        class_name = f"Flow_{idx}_{_slugify(name)}"
+        class_name = f"{self.flow_prefix}_{idx}_{_slugify(name)}"
         weight = _safe_int(flow.get("weight"), 1)
         if weight < 1:
             weight = 1
@@ -505,8 +671,11 @@ class ScenarioGenerator:
         return class_name, weight, lines
 
     def _generate_user_class(self, flow_entries: List[Tuple[str, int]]) -> List[str]:
-        """Generate the main User class."""
-        lines = ["", "", "class GeneratedUser(HttpUser):"]
+        """Generate the user class for this persona."""
+        lines = ["", "", f"class {self.class_name}(_RuntimeMixin, HttpUser):"]
+
+        if self.weight is not None:
+            lines.append(f"    weight = {self.weight}")
 
         # Wait time
         think_expr = self._think_time_expr(self.scenario.get("think_time"))
@@ -526,8 +695,6 @@ class ScenarioGenerator:
         if flow_entries:
             tasks_repr = "{" + ", ".join(f"{cn}: {w}" for cn, w in flow_entries) + "}"
             lines.append(f"    tasks = {tasks_repr}")
-
-        lines.extend(self._generate_resolver_methods())
 
         # on_start: always generated — initializes the per-user variables
         # store used by capture and the resolver.
@@ -559,6 +726,23 @@ class ScenarioGenerator:
             "        '''Run once per user at start (login, setup, etc.).'''",
             "        self._vars = {}",
         ]
+
+        if self.data_specs:
+            pool_names = sorted(self.data_specs)
+            lines.extend([
+                "        # Pin per-user data rows (unique_per_user / once modes)",
+                "        self._data_rows = {}",
+                f"        for _pool_name in {pool_names!r}:",
+                "            _spec = _DATA_SPECS.get(_pool_name) or {}",
+                "            _mode = _spec.get('mode', 'unique_per_user')",
+                "            _rows = _load_pool(_pool_name)",
+                "            if not _rows:",
+                "                continue",
+                "            if _mode == 'once':",
+                "                self._data_rows[_pool_name] = _rows[0]",
+                "            elif _mode == 'unique_per_user':",
+                "                self._data_rows[_pool_name] = _rows[_next_index(_pool_name, len(_rows))]",
+            ])
 
         if basic_auth:
             user, password = basic_auth
@@ -607,20 +791,97 @@ class ScenarioGenerator:
         return lines
 
 
+def _write_locustfile(generators: List[ScenarioGenerator], output_dir: Path) -> Path:
+    """Prepare all personas, merge data pools, and write the locustfile."""
+    merged_specs: Dict[str, Dict[str, Any]] = {}
+    for gen in generators:
+        gen.prepare()
+        for name, spec in gen.data_specs.items():
+            existing = merged_specs.get(name)
+            if existing is not None and existing != spec:
+                raise ValueError(
+                    f"data pool {name!r} is defined differently in multiple personas; "
+                    "pool names are global — use one shared definition or distinct names"
+                )
+            merged_specs[name] = spec
+
+    lines = _emit_imports()
+    lines.extend(_emit_helpers())
+    lines.extend(_emit_data_layer(merged_specs))
+    lines.extend(_emit_runtime_mixin())
+    for gen in generators:
+        lines.extend(gen.emit_classes())
+
+    output_path = output_dir / "generated_locustfile.py"
+    ensure_dir(output_dir)
+    write_text(output_path, "\n".join(lines) + "\n")
+    return output_path
+
+
+def _build_persona_generators(
+    users: List[Any],
+    target: Dict[str, Any],
+) -> List[ScenarioGenerator]:
+    """Build one ScenarioGenerator per persona from a users list.
+
+    Each entry is either {"weight": N, "name": ..., "scenario": {...}} or a
+    flat form where the scenario fields live directly on the entry (as
+    produced by "include" of a bare scenario file).
+    """
+    generators: List[ScenarioGenerator] = []
+    for idx, entry in enumerate(users, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"users[{idx}] must be an object, got {type(entry).__name__}"
+            )
+        weight = _safe_int(entry.get("weight"), 1)
+        if weight < 1:
+            weight = 1
+        scenario = entry.get("scenario")
+        if not isinstance(scenario, dict):
+            scenario = {
+                key: value
+                for key, value in entry.items()
+                if key not in ("weight", "name", "scenario")
+            }
+        name = str(entry.get("name") or f"user_{idx}")
+        class_name = f"User_{idx}_{_slugify(name)}"
+        generators.append(
+            ScenarioGenerator(
+                scenario,
+                target,
+                class_name=class_name,
+                weight=weight,
+                flow_prefix=f"Flow{idx}",
+                section_prefix=f"users[{idx}]",
+            )
+        )
+    return generators
+
+
 def generate_locustfile(
     scenario: Dict[str, Any],
     target: Dict[str, Any],
     output_dir: Path,
+    users: Optional[List[Any]] = None,
 ) -> Path:
     """Generate a locustfile from scenario configuration.
 
     Args:
         scenario: The scenario configuration dict containing requests/flows.
+            Ignored when `users` is provided.
         target: The target/load configuration with host, headers, tags, etc.
         output_dir: Directory to write the generated file.
+        users: Optional list of personas. Each persona gets its own HttpUser
+            class with a scheduling weight:
+            [{"weight": 4, "name": "reader", "scenario": {...}},
+             {"weight": 1, "name": "buyer", "scenario": {...}}]
 
     Returns:
         Path to the generated locustfile.
     """
-    generator = ScenarioGenerator(scenario, target)
-    return generator.generate(output_dir)
+    if users:
+        generators = _build_persona_generators(users, target)
+    else:
+        generators = [ScenarioGenerator(scenario or {}, target)]
+    return _write_locustfile(generators, output_dir)
