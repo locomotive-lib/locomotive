@@ -54,7 +54,24 @@ class ScenarioGenerator:
             {"method": "POST", "path": "/login",
              "capture": {"auth_token": "data.token"}, ...}
         ],
-        "requests": [
+        "on_stop": [  # requests to run once per user at stop (teardown)
+            {"method": "POST", "path": "/logout"}
+        ],
+        "flows": [  # ordered multi-step user journeys
+            {
+                "name": "Checkout",
+                "weight": 3,
+                "think_time": 1.0,           # optional, overrides user's
+                "tags": ["purchase"],        # optional
+                "steps": [
+                    {"name": "Create order", "method": "POST", "path": "/orders",
+                     "capture": {"order_id": "id"}},
+                    {"name": "Pay", "method": "POST",
+                     "path": "/orders/${var:order_id}/pay"}
+                ]
+            }
+        ],
+        "requests": [  # flat weighted-random tasks (can coexist with flows)
             {
                 "name": "Get Users",
                 "method": "GET",
@@ -63,7 +80,8 @@ class ScenarioGenerator:
                 "headers": {},
                 "query": {},
                 "json": {},
-                "tags": ["api"]
+                "tags": ["api"],
+                "capture": {"first_id": "items.0"}   # optional
             }
         ]
     }
@@ -84,46 +102,69 @@ class ScenarioGenerator:
         self.scenario = scenario
         self.target = target
         self.requests: List[Dict[str, Any]] = []
+        self.flows: List[Dict[str, Any]] = []
 
-    def load_requests(self) -> None:
-        """Load requests from config."""
-        self.requests = self.scenario.get("requests", [])
-        if not isinstance(self.requests, list):
-            self.requests = []
-
-        # Filter by tags if specified
+    def _filter_by_tags(self, items: List[Any]) -> List[Any]:
+        """Filter requests/flows by target include/exclude tags."""
         include_tags = self.target.get("tags") or []
         exclude_tags = self.target.get("exclude_tags") or []
+        if not include_tags and not exclude_tags:
+            return items
 
-        if include_tags or exclude_tags:
-            include_set = set(include_tags) if include_tags else None
-            exclude_set = set(exclude_tags) if exclude_tags else set()
+        include_set = set(include_tags) if include_tags else None
+        exclude_set = set(exclude_tags) if exclude_tags else set()
 
-            filtered = []
-            for req in self.requests:
-                req_tags = set(req.get("tags", [])) if isinstance(req, dict) else set()
-                if req_tags & exclude_set:
-                    continue
-                if include_set is not None and not (req_tags & include_set):
-                    continue
-                filtered.append(req)
-            self.requests = filtered
+        filtered = []
+        for item in items:
+            item_tags = set(item.get("tags", [])) if isinstance(item, dict) else set()
+            if item_tags & exclude_set:
+                continue
+            if include_set is not None and not (item_tags & include_set):
+                continue
+            filtered.append(item)
+        return filtered
+
+    def load_requests(self) -> None:
+        """Load flat requests from config."""
+        requests = self.scenario.get("requests", [])
+        if not isinstance(requests, list):
+            requests = []
+        self.requests = self._filter_by_tags(requests)
+
+    def load_flows(self) -> None:
+        """Load flows from config."""
+        flows = self.scenario.get("flows", [])
+        if not isinstance(flows, list):
+            flows = []
+        self.flows = self._filter_by_tags(flows)
 
     def generate(self, output_dir: Path) -> Path:
         """Generate the locustfile and return its path."""
         self.load_requests()
+        self.load_flows()
 
-        if not self.requests:
-            raise ValueError("scenario.requests must be a non-empty list")
+        if not self.requests and not self.flows:
+            raise ValueError(
+                "scenario must define a non-empty 'requests' or 'flows' list"
+            )
 
         self._validate_requests(self.requests, "scenario.requests")
-        on_start = self.scenario.get("on_start")
-        if isinstance(on_start, list):
-            self._validate_requests(on_start, "scenario.on_start")
+        self._validate_flows(self.flows)
+        for section in ("on_start", "on_stop"):
+            entries = self.scenario.get(section)
+            if isinstance(entries, list):
+                self._validate_requests(entries, f"scenario.{section}")
 
         lines = self._generate_imports()
         lines.extend(self._generate_helpers())
-        lines.extend(self._generate_user_class())
+
+        flow_entries: List[Tuple[str, int]] = []
+        for idx, flow in enumerate(self.flows, start=1):
+            class_name, weight, flow_lines = self._generate_flow_class(idx, flow)
+            flow_entries.append((class_name, weight))
+            lines.extend(flow_lines)
+
+        lines.extend(self._generate_user_class(flow_entries))
 
         output_path = output_dir / "generated_locustfile.py"
         ensure_dir(output_dir)
@@ -145,6 +186,20 @@ class ScenarioGenerator:
                     f"{section}[{idx}] ({label!r}) is missing required 'path'"
                 )
 
+    def _validate_flows(self, flows: List[Any]) -> None:
+        for idx, flow in enumerate(flows, start=1):
+            if not isinstance(flow, dict):
+                raise ValueError(
+                    f"scenario.flows[{idx}] must be an object, got {type(flow).__name__}"
+                )
+            label = flow.get("name") or f"flow_{idx}"
+            steps = flow.get("steps")
+            if not isinstance(steps, list) or not steps:
+                raise ValueError(
+                    f"scenario.flows[{idx}] ({label!r}) must define a non-empty 'steps' list"
+                )
+            self._validate_requests(steps, f"scenario.flows[{idx}].steps")
+
     def _generate_imports(self) -> List[str]:
         """Generate import statements."""
         return [
@@ -154,7 +209,7 @@ class ScenarioGenerator:
             "import time",
             "import random",
             "import uuid",
-            "from locust import HttpUser, task, between, tag",
+            "from locust import HttpUser, SequentialTaskSet, task, between, tag",
             "",
         ]
 
@@ -324,49 +379,25 @@ class ScenarioGenerator:
             base_headers[header_name] = key
         return None
 
-    def _generate_user_class(self) -> List[str]:
-        """Generate the main User class."""
-        lines = ["", "class GeneratedUser(HttpUser):"]
-
-        # Wait time
-        think_time = self.scenario.get("think_time")
+    @staticmethod
+    def _think_time_expr(think_time: Any) -> Optional[str]:
+        """Build a between(...) expression from a think_time config value."""
         if isinstance(think_time, dict):
             min_wait = _safe_float(think_time.get("min"), 0.5)
             max_wait = _safe_float(think_time.get("max"), min_wait)
-            lines.append(f"    wait_time = between({min_wait}, {max_wait})")
-        elif think_time is not None:
+            return f"between({min_wait}, {max_wait})"
+        if think_time is not None:
             value = _safe_float(think_time, 1.0)
-            lines.append(f"    wait_time = between({value}, {value})")
-        else:
-            lines.append("    wait_time = between(0.5, 2.0)")
+            return f"between({value}, {value})"
+        return None
 
-        # Gather headers
-        scenario_headers = self.scenario.get("headers") if isinstance(self.scenario.get("headers"), dict) else {}
-        target_headers = self.target.get("headers") if isinstance(self.target.get("headers"), dict) else {}
-        base_headers = {**target_headers, **scenario_headers}
+    def _build_request_call(self, req: Dict[str, Any], user_expr: str = "self") -> str:
+        """Build the argument list for a self.client.request(...) call.
 
-        basic_auth = self._auth_config(base_headers)
-
-        # Store base headers as class attribute (placeholders resolved per request)
-        lines.append(f"    _base_headers = {repr(base_headers)}")
-
-        lines.extend(self._generate_resolver_methods())
-
-        # on_start for setup (variables store, basic auth, login, etc.)
-        on_start = self.scenario.get("on_start")
-        on_start_requests = on_start if isinstance(on_start, list) else []
-        if on_start_requests or basic_auth:
-            lines.extend(self._generate_on_start(on_start_requests, basic_auth))
-
-        # Generate tasks
-        for idx, req in enumerate(self.requests, start=1):
-            task_lines = self._generate_task(idx, req)
-            lines.extend(task_lines)
-
-        return lines
-
-    def _build_request_call(self, req: Dict[str, Any]) -> str:
-        """Build the argument list for a self.client.request(...) call."""
+        user_expr is the expression that reaches the User instance from the
+        generated context: "self" inside the User class, "self.user" inside
+        a flow (SequentialTaskSet).
+        """
         method = str(req.get("method", "GET")).upper()
         path = str(req.get("path"))
         name = req.get("name") or f"{method} {path}"
@@ -374,7 +405,7 @@ class ScenarioGenerator:
         # Resolve dynamic path segments at runtime, but keep the template
         # string as the stats name so Locust groups all calls together.
         if "${" in path:
-            path_expr = f"self._resolve({repr(path)})"
+            path_expr = f"{user_expr}._resolve({repr(path)})"
         else:
             path_expr = repr(path)
 
@@ -389,20 +420,132 @@ class ScenarioGenerator:
 
         if req_headers:
             kwargs.append(
-                f"headers=self._resolve_dict({{**self._base_headers, **{repr(req_headers)}}})"
+                f"headers={user_expr}._resolve_dict({{**{user_expr}._base_headers, **{repr(req_headers)}}})"
             )
         else:
-            kwargs.append("headers=self._resolve_dict(self._base_headers)")
+            kwargs.append(f"headers={user_expr}._resolve_dict({user_expr}._base_headers)")
         if params:
-            kwargs.append(f"params=self._resolve_dict({repr(params)})")
+            kwargs.append(f"params={user_expr}._resolve_dict({repr(params)})")
         if json_body is not None:
-            kwargs.append(f"json=self._resolve_dict({repr(json_body)})")
+            kwargs.append(f"json={user_expr}._resolve_dict({repr(json_body)})")
         if data_body is not None:
-            kwargs.append(f"data=self._resolve_dict({repr(data_body)})")
+            kwargs.append(f"data={user_expr}._resolve_dict({repr(data_body)})")
         if timeout is not None:
             kwargs.append(f"timeout={repr(timeout)}")
 
         return ", ".join(args + kwargs)
+
+    def _generate_request_stmt(
+        self,
+        req: Dict[str, Any],
+        indent: int,
+        user_expr: str = "self",
+    ) -> List[str]:
+        """Generate the request call plus optional capture handling."""
+        pad = " " * indent
+        call = self._build_request_call(req, user_expr)
+
+        capture = req.get("capture")
+        if not (isinstance(capture, dict) and capture):
+            return [f"{pad}self.client.request({call})"]
+
+        lines = [f"{pad}resp = self.client.request({call})"]
+        for var_name, json_path in capture.items():
+            # Simple json path like "token" or "data.access_token"
+            accessor = "data"
+            for part in str(json_path).split("."):
+                accessor += f"[{repr(part)}]"
+            lines.append(f"{pad}try:")
+            lines.append(f"{pad}    data = resp.json()")
+            lines.append(f"{pad}    {user_expr}._vars[{repr(str(var_name))}] = {accessor}")
+            lines.append(f"{pad}except Exception:")
+            lines.append(f"{pad}    {user_expr}._vars[{repr(str(var_name))}] = None")
+        return lines
+
+    def _generate_flow_class(
+        self, idx: int, flow: Dict[str, Any]
+    ) -> Tuple[str, int, List[str]]:
+        """Generate a SequentialTaskSet class for a flow.
+
+        Returns (class_name, weight, lines).
+        """
+        name = str(flow.get("name") or f"flow_{idx}")
+        class_name = f"Flow_{idx}_{_slugify(name)}"
+        weight = _safe_int(flow.get("weight"), 1)
+        if weight < 1:
+            weight = 1
+
+        lines = ["", ""]
+        tags = flow.get("tags") if isinstance(flow.get("tags"), list) else []
+        for t in tags:
+            lines.append(f"@tag({repr(str(t))})")
+        lines.append(f"class {class_name}(SequentialTaskSet):")
+
+        think_expr = self._think_time_expr(flow.get("think_time"))
+        if think_expr:
+            lines.append(f"    wait_time = {think_expr}")
+
+        for sidx, step in enumerate(flow["steps"], start=1):
+            func_name = _slugify(step.get("name") or f"step_{sidx}")
+            step_tags = step.get("tags") if isinstance(step.get("tags"), list) else []
+            lines.append("")
+            for t in step_tags:
+                lines.append(f"    @tag({repr(str(t))})")
+            lines.append("    @task")
+            lines.append(f"    def step_{sidx}_{func_name}(self):")
+            lines.extend(self._generate_request_stmt(step, indent=8, user_expr="self.user"))
+
+        # Return control to the User after the last step so other flows and
+        # flat tasks get scheduled (otherwise the SequentialTaskSet loops).
+        lines.append("")
+        lines.append("    @task")
+        lines.append("    def _flow_complete(self):")
+        lines.append("        self.interrupt(reschedule=False)")
+
+        return class_name, weight, lines
+
+    def _generate_user_class(self, flow_entries: List[Tuple[str, int]]) -> List[str]:
+        """Generate the main User class."""
+        lines = ["", "", "class GeneratedUser(HttpUser):"]
+
+        # Wait time
+        think_expr = self._think_time_expr(self.scenario.get("think_time"))
+        lines.append(f"    wait_time = {think_expr or 'between(0.5, 2.0)'}")
+
+        # Gather headers
+        scenario_headers = self.scenario.get("headers") if isinstance(self.scenario.get("headers"), dict) else {}
+        target_headers = self.target.get("headers") if isinstance(self.target.get("headers"), dict) else {}
+        base_headers = {**target_headers, **scenario_headers}
+
+        basic_auth = self._auth_config(base_headers)
+
+        # Store base headers as class attribute (placeholders resolved per request)
+        lines.append(f"    _base_headers = {repr(base_headers)}")
+
+        # Flows participate in scheduling alongside flat @task methods
+        if flow_entries:
+            tasks_repr = "{" + ", ".join(f"{cn}: {w}" for cn, w in flow_entries) + "}"
+            lines.append(f"    tasks = {tasks_repr}")
+
+        lines.extend(self._generate_resolver_methods())
+
+        # on_start: always generated — initializes the per-user variables
+        # store used by capture and the resolver.
+        on_start = self.scenario.get("on_start")
+        on_start_requests = on_start if isinstance(on_start, list) else []
+        lines.extend(self._generate_on_start(on_start_requests, basic_auth))
+
+        # on_stop: teardown requests (logout etc.)
+        on_stop = self.scenario.get("on_stop")
+        on_stop_requests = on_stop if isinstance(on_stop, list) else []
+        if on_stop_requests:
+            lines.extend(self._generate_on_stop(on_stop_requests))
+
+        # Flat weighted-random tasks
+        for idx, req in enumerate(self.requests, start=1):
+            lines.extend(self._generate_task(idx, req))
+
+        return lines
 
     def _generate_on_start(
         self,
@@ -426,28 +569,23 @@ class ScenarioGenerator:
             )
 
         for req in requests:
-            call = self._build_request_call(req)
-
-            capture = req.get("capture")
-            if isinstance(capture, dict) and capture:
-                lines.append(f"        resp = self.client.request({call})")
-                for var_name, json_path in capture.items():
-                    # Simple json path like "token" or "data.access_token"
-                    accessor = "data"
-                    for part in str(json_path).split("."):
-                        accessor += f"[{repr(part)}]"
-                    lines.append("        try:")
-                    lines.append("            data = resp.json()")
-                    lines.append(f"            self._vars[{repr(str(var_name))}] = {accessor}")
-                    lines.append("        except Exception:")
-                    lines.append(f"            self._vars[{repr(str(var_name))}] = None")
-            else:
-                lines.append(f"        self.client.request({call})")
+            lines.extend(self._generate_request_stmt(req, indent=8, user_expr="self"))
 
         return lines
 
+    def _generate_on_stop(self, requests: List[Dict[str, Any]]) -> List[str]:
+        """Generate on_stop method for user teardown."""
+        lines = [
+            "",
+            "    def on_stop(self):",
+            "        '''Run once per user at stop (logout, cleanup, etc.).'''",
+        ]
+        for req in requests:
+            lines.extend(self._generate_request_stmt(req, indent=8, user_expr="self"))
+        return lines
+
     def _generate_task(self, idx: int, req: Dict[str, Any]) -> List[str]:
-        """Generate a single task method."""
+        """Generate a single flat task method."""
         method = str(req.get("method", "GET")).upper()
         path = str(req.get("path"))
         weight = _safe_int(req.get("weight"), 1)
@@ -456,7 +594,6 @@ class ScenarioGenerator:
 
         tags = req.get("tags") if isinstance(req.get("tags"), list) else []
 
-        call = self._build_request_call(req)
         func_name = _slugify(req.get("name") or f"{method}_{path}")
         func_name = f"task_{idx}_{func_name}"
 
@@ -465,7 +602,7 @@ class ScenarioGenerator:
             lines.append(f"    @tag({repr(str(t))})")
         lines.append(f"    @task({weight})")
         lines.append(f"    def {func_name}(self):")
-        lines.append(f"        self.client.request({call})")
+        lines.extend(self._generate_request_stmt(req, indent=8, user_expr="self"))
 
         return lines
 
@@ -478,7 +615,7 @@ def generate_locustfile(
     """Generate a locustfile from scenario configuration.
 
     Args:
-        scenario: The scenario configuration dict containing requests.
+        scenario: The scenario configuration dict containing requests/flows.
         target: The target/load configuration with host, headers, tags, etc.
         output_dir: Directory to write the generated file.
 

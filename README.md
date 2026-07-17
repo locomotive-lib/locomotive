@@ -141,7 +141,11 @@ User scenario definition: headers, auth, and requests.
         "capture": {"auth_token": "data.token"}
       }
     ],
-    "requests": [...]                          // request array (see below)
+    "on_stop": [                               // runs once per user at shutdown (teardown)
+      {"name": "Logout", "method": "POST", "path": "/auth/logout"}
+    ],
+    "flows": [...],                            // multi-step user journeys (see Flows)
+    "requests": [...]                          // flat weighted requests (see below)
   }
 }
 ```
@@ -239,6 +243,50 @@ Everything is configured declaratively — no need to edit the generated locustf
 `capture` is a `{"variable_name": "json.path"}` dict. The path is dot-separated: `"data.token"` means `response["data"]["token"]`.
 
 Captured values are stored per virtual user and can be referenced from any request — in headers, paths, query, or bodies — as `${auth_token}` or explicitly as `${var:auth_token}`. A bare `${name}` checks captured variables first, then environment variables. If a capture fails (unexpected response shape), the variable resolves to an empty string.
+
+`capture` works in `on_start` requests, in flat `requests`, and in any flow step.
+
+## Flows (multi-step user journeys)
+
+Flows describe ordered sequences of requests — a user journey like "browse → create order → pay". Steps run strictly in order; values captured in one step can be used in the next:
+
+```jsonc
+{
+  "scenario": {
+    "flows": [
+      {
+        "name": "Checkout",
+        "weight": 3,                            // scheduling weight vs other flows/requests
+        "think_time": {"min": 1.0, "max": 2.0}, // optional: overrides the user's think_time inside the flow
+        "tags": ["purchase"],                   // optional: tags for the whole flow
+        "steps": [
+          {"name": "Browse", "method": "GET", "path": "/catalog"},
+          {
+            "name": "Create order",
+            "method": "POST",
+            "path": "/orders",
+            "json": {"product_id": "${randint:1:100}"},
+            "capture": {"order_id": "id"}       // captured for the next step
+          },
+          {"name": "Pay", "method": "POST", "path": "/orders/${var:order_id}/pay"}
+        ]
+      }
+    ],
+    "requests": [                               // flat requests coexist with flows
+      {"name": "Health", "method": "GET", "path": "/health", "weight": 1}
+    ]
+  }
+}
+```
+
+How it works:
+
+- Each flow becomes a Locust `SequentialTaskSet` — steps execute in declaration order.
+- `weight` controls how often the flow is picked relative to other flows and flat `requests` (here: Checkout runs 3× more often than Health).
+- After the last step, control returns to the scheduler (the flow does not loop internally).
+- A step supports everything a request does: `headers`, `query`, `json`, `data`, `timeout`, `tags`, `capture`.
+- Variables captured in a step are stored per virtual user and are visible in later steps, in other flows, and in flat requests.
+- Flow-level `tags` participate in `--tags` / `--exclude-tags` filtering, same as request tags.
 
 ## Rules vs Gates
 

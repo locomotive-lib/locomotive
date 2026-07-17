@@ -196,6 +196,20 @@ def generate_template(
                     }
                 }
             ],
+            "_flows_example": [
+                {
+                    "_comment": "Rename to 'flows' for ordered multi-step journeys; captured vars chain between steps",
+                    "name": "Checkout",
+                    "weight": 2,
+                    "steps": [
+                        {"name": "Create order", "method": "POST", "path": "/orders",
+                         "json": {"product_id": "${randint:1:100}"},
+                         "capture": {"order_id": "id"}},
+                        {"name": "Pay", "method": "POST",
+                         "path": "/orders/${var:order_id}/pay"}
+                    ]
+                }
+            ],
             "requests": requests
         },
         "artifacts": {

@@ -45,9 +45,25 @@ def _exec_generated(tmp_path, scenario, target=None):
     """Generate a locustfile and exec it with a fake `locust` module."""
     content = _generate(tmp_path, scenario, target)
 
+    def fake_task(arg=1):
+        if callable(arg):  # bare @task
+            return arg
+        return lambda f: f  # @task(N)
+
+    class FakeSequentialTaskSet:
+        def __init__(self, parent=None):
+            self.parent = parent
+            self.user = getattr(parent, "user", parent)
+            self.client = getattr(self.user, "client", None)
+            self.interrupted = False
+
+        def interrupt(self, reschedule=True):
+            self.interrupted = True
+
     fake = types.ModuleType("locust")
     fake.HttpUser = type("HttpUser", (), {})
-    fake.task = lambda weight=1: (lambda f: f)
+    fake.SequentialTaskSet = FakeSequentialTaskSet
+    fake.task = fake_task
     fake.tag = lambda *tags: (lambda f: f)
     fake.between = lambda a, b: (a, b)
 
@@ -572,3 +588,248 @@ class TestDynamicFunctions:
         monkeypatch.setenv("uuid", "not-a-uuid")
         user = self._user(tmp_path)
         assert user._resolve("${uuid}") != "not-a-uuid"
+
+
+# ── B: multi-step flows ───────────────────────────────────────────────
+
+
+def _make_flow(namespace, class_name, user):
+    """Instantiate a generated flow bound to a user."""
+    flow = namespace[class_name](user)
+    flow.user = user
+    flow.client = user.client
+    return flow
+
+
+CHECKOUT_SCENARIO = {
+    "flows": [
+        {
+            "name": "Checkout",
+            "weight": 3,
+            "steps": [
+                {"name": "Browse", "method": "GET", "path": "/catalog"},
+                {
+                    "name": "Create order",
+                    "method": "POST",
+                    "path": "/orders",
+                    "json": {"product": "x"},
+                    "capture": {"order_id": "id"},
+                },
+                {
+                    "name": "Pay",
+                    "method": "POST",
+                    "path": "/orders/${var:order_id}/pay",
+                },
+            ],
+        }
+    ],
+    "requests": [{"name": "Health", "method": "GET", "path": "/health", "weight": 2}],
+}
+
+
+class TestFlowGeneration:
+    def test_flow_class_generated(self, tmp_path):
+        content = _generate(tmp_path, CHECKOUT_SCENARIO)
+        assert "class Flow_1_checkout(SequentialTaskSet):" in content
+        assert "def step_1_browse(self):" in content
+        assert "def step_2_create_order(self):" in content
+        assert "def step_3_pay(self):" in content
+        assert "def _flow_complete(self):" in content
+        assert "self.interrupt(reschedule=False)" in content
+
+    def test_steps_in_declaration_order(self, tmp_path):
+        content = _generate(tmp_path, CHECKOUT_SCENARIO)
+        assert (
+            content.index("step_1_browse")
+            < content.index("step_2_create_order")
+            < content.index("step_3_pay")
+            < content.index("_flow_complete")
+        )
+
+    def test_tasks_dict_with_weight(self, tmp_path):
+        content = _generate(tmp_path, CHECKOUT_SCENARIO)
+        assert "tasks = {Flow_1_checkout: 3}" in content
+
+    def test_flat_requests_coexist(self, tmp_path):
+        content = _generate(tmp_path, CHECKOUT_SCENARIO)
+        assert "@task(2)" in content
+        assert "def task_1_health(self):" in content
+
+    def test_multiple_flows(self, tmp_path):
+        scenario = {
+            "flows": [
+                {"name": "A", "weight": 1, "steps": [{"method": "GET", "path": "/a"}]},
+                {"name": "B", "weight": 4, "steps": [{"method": "GET", "path": "/b"}]},
+            ]
+        }
+        content = _generate(tmp_path, scenario)
+        assert "tasks = {Flow_1_a: 1, Flow_2_b: 4}" in content
+
+    def test_flow_think_time(self, tmp_path):
+        scenario = {
+            "flows": [
+                {
+                    "name": "Slow",
+                    "think_time": {"min": 2.0, "max": 5.0},
+                    "steps": [{"method": "GET", "path": "/s"}],
+                }
+            ]
+        }
+        content = _generate(tmp_path, scenario)
+        # wait_time on the flow class overrides the user's
+        flow_part = content[content.index("class Flow_1_slow") :]
+        assert "wait_time = between(2.0, 5.0)" in flow_part
+
+    def test_flow_tags_on_class_and_steps(self, tmp_path):
+        scenario = {
+            "flows": [
+                {
+                    "name": "Tagged",
+                    "tags": ["journey"],
+                    "steps": [
+                        {"method": "GET", "path": "/x", "tags": ["smoke"]}
+                    ],
+                }
+            ]
+        }
+        content = _generate(tmp_path, scenario)
+        flow_part = content[content.index("@tag('journey')") :]
+        assert flow_part.splitlines()[1].startswith("class Flow_1_tagged")
+        assert "@tag('smoke')" in flow_part
+
+
+class TestFlowRuntime:
+    def test_variable_chaining_between_steps(self, tmp_path):
+        ns = _exec_generated(tmp_path, CHECKOUT_SCENARIO)
+        user = _make_user(ns, {"id": 555})
+        user.on_start()
+        flow = _make_flow(ns, "Flow_1_checkout", user)
+
+        flow.step_1_browse()
+        flow.step_2_create_order()
+        assert user._vars["order_id"] == 555
+        flow.step_3_pay()
+
+        calls = user.client.calls
+        assert calls[0]["url"] == "/catalog"
+        assert calls[1]["url"] == "/orders"
+        assert calls[2]["url"] == "/orders/555/pay"
+        assert calls[2]["name"] == "Pay"
+
+    def test_flow_complete_interrupts(self, tmp_path):
+        ns = _exec_generated(tmp_path, CHECKOUT_SCENARIO)
+        user = _make_user(ns)
+        flow = _make_flow(ns, "Flow_1_checkout", user)
+        flow._flow_complete()
+        assert flow.interrupted is True
+
+    def test_base_headers_reach_flow_steps(self, tmp_path):
+        scenario = {
+            "headers": {"X-Common": "yes"},
+            "flows": [
+                {"name": "F", "steps": [{"method": "GET", "path": "/a"}]}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        flow = _make_flow(ns, "Flow_1_f", user)
+        flow.step_1_step_1()
+        assert user.client.calls[-1]["headers"]["X-Common"] == "yes"
+
+
+class TestFlowFiltering:
+    def test_exclude_flow_by_tag(self, tmp_path):
+        scenario = {
+            "flows": [
+                {"name": "Keep", "steps": [{"method": "GET", "path": "/k"}]},
+                {"name": "Drop", "tags": ["slow"],
+                 "steps": [{"method": "GET", "path": "/d"}]},
+            ]
+        }
+        content = _generate(tmp_path, scenario, {"exclude_tags": ["slow"]})
+        assert "Flow_1_keep" in content
+        assert "drop" not in content.lower()
+
+    def test_include_only_tagged_flows(self, tmp_path):
+        scenario = {
+            "flows": [
+                {"name": "Api", "tags": ["api"],
+                 "steps": [{"method": "GET", "path": "/a"}]},
+                {"name": "Other", "steps": [{"method": "GET", "path": "/o"}]},
+            ]
+        }
+        content = _generate(tmp_path, scenario, {"tags": ["api"]})
+        assert "Flow_1_api" in content
+        assert "Flow_2_other" not in content
+
+
+class TestFlowValidation:
+    def test_flow_without_steps_raises(self, tmp_path):
+        scenario = {"flows": [{"name": "Empty"}]}
+        gen = ScenarioGenerator(scenario, {})
+        with pytest.raises(ValueError, match=r"flows\[1\].*Empty.*'steps'"):
+            gen.generate(tmp_path)
+
+    def test_step_missing_path_raises(self, tmp_path):
+        scenario = {
+            "flows": [{"name": "F", "steps": [{"method": "POST", "name": "Bad"}]}]
+        }
+        gen = ScenarioGenerator(scenario, {})
+        with pytest.raises(ValueError, match=r"flows\[1\]\.steps\[1\].*Bad"):
+            gen.generate(tmp_path)
+
+    def test_flows_only_config_valid(self, tmp_path):
+        scenario = {
+            "flows": [{"name": "F", "steps": [{"method": "GET", "path": "/x"}]}]
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        assert "GeneratedUser" in ns
+
+    def test_no_requests_no_flows_raises(self, tmp_path):
+        gen = ScenarioGenerator({}, {})
+        with pytest.raises(ValueError, match="non-empty"):
+            gen.generate(tmp_path)
+
+
+# ── on_stop (teardown) ────────────────────────────────────────────────
+
+
+class TestOnStop:
+    def test_on_stop_generated_and_called(self, tmp_path):
+        scenario = {
+            "on_stop": [{"name": "Logout", "method": "POST", "path": "/logout"}],
+            "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.on_stop()
+        assert user.client.calls[-1]["url"] == "/logout"
+        assert user.client.calls[-1]["method"] == "POST"
+
+    def test_no_on_stop_by_default(self, tmp_path):
+        scenario = {"requests": [{"name": "P", "method": "GET", "path": "/p"}]}
+        content = _generate(tmp_path, scenario)
+        assert "def on_stop" not in content
+
+
+# ── capture in flat requests ──────────────────────────────────────────
+
+
+class TestCaptureInFlatRequests:
+    def test_capture_from_task(self, tmp_path):
+        scenario = {
+            "requests": [
+                {"name": "List", "method": "GET", "path": "/items",
+                 "capture": {"first": "items.0"}},
+                {"name": "Use", "method": "GET", "path": "/items/${var:first}"},
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns, {"items": {"0": "abc"}})
+        user.on_start()
+        user.task_1_list()
+        assert user._vars["first"] == "abc"
+        user.task_2_use()
+        assert user.client.calls[-1]["url"] == "/items/abc"

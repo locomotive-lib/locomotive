@@ -158,8 +158,8 @@ def _maybe_generate_locustfile(
     if not scenario:
         raise ValueError("Either 'locustfile' in load config or 'scenario' section is required")
     
-    if not scenario.get("requests"):
-        raise ValueError("scenario.requests must be a non-empty list")
+    if not scenario.get("requests") and not scenario.get("flows"):
+        raise ValueError("scenario must define a non-empty 'requests' or 'flows' list")
     
     output_dir = storage.run_dir(run_id) / "generated"
     locustfile_path = generate_locustfile(scenario, locust_config, output_dir)
