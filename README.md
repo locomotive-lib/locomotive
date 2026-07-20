@@ -1,6 +1,6 @@
 # Locomotive — CI Load Testing Library
 
-[![Tests](https://github.com/locomotive-lib/locomotive/actions/workflows/tests.yml/badge.svg)](https://github.com/locomotive-lib/locomotive/actions/workflows/release.yml)
+[![CI](https://github.com/locomotive-lib/locomotive/actions/workflows/release.yml/badge.svg?branch=master)](https://github.com/locomotive-lib/locomotive/actions/workflows/release.yml)
 [![Python](https://img.shields.io/pypi/pyversions/locomotive)](https://pypi.org/project/locomotive/)
 [![PyPI](https://img.shields.io/pypi/v/locomotive)](https://pypi.org/project/locomotive/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
