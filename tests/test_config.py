@@ -352,3 +352,33 @@ class TestInclude:
         result = load_config(config_path)
         headers = result["users"][0]["scenario"]["headers"]
         assert headers["Authorization"] == "Bearer ${tok}"
+
+
+class TestFakePreservation:
+    """Synthetic-data placeholders must survive config loading."""
+
+    @pytest.mark.parametrize("value", [
+        "${fake:email}",
+        "${fake:name}",
+        "${fake:digits:5}",
+        "${fake:words:3}",
+    ])
+    def test_preserved(self, value):
+        assert _resolve_env_value(value) == value
+
+    def test_is_runtime_placeholder(self):
+        assert is_runtime_placeholder("fake:email") is True
+        assert is_runtime_placeholder("fake:digits:5") is True
+
+    def test_generate_fields_preserved_end_to_end(self, tmp_path):
+        config = {
+            "scenario": {
+                "data": {"people": {"generate": {"count": 5, "fields": {"email": "${fake:email}"}}}},
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }
+        }
+        config_path = tmp_path / "loconfig.json"
+        config_path.write_text(json.dumps(config))
+        result = load_config(config_path)
+        fields = result["scenario"]["data"]["people"]["generate"]["fields"]
+        assert fields["email"] == "${fake:email}"

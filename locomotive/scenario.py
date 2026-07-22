@@ -149,6 +149,81 @@ def _emit_helpers() -> List[str]:
         "            return time.strftime('%Y-%m-%dT%H:%M:%S')",
         "    return ''",
         "",
+        "",
+        "_FAKE_FIRST = ['James', 'Mary', 'John', 'Patricia', 'Robert', 'Jennifer', 'Michael', 'Linda', 'David', 'Elizabeth', 'William', 'Barbara', 'Richard', 'Susan', 'Joseph', 'Jessica', 'Thomas', 'Karen', 'Daniel', 'Nancy', 'Anna', 'Ivan', 'Olga', 'Sergei', 'Maria', 'Dmitry']",
+        "_FAKE_LAST = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Wilson', 'Anderson', 'Taylor', 'Moore', 'Petrov', 'Ivanov', 'Sidorov', 'Kim', 'Lee', 'Wang', 'Nguyen', 'Muller', 'Rossi', 'Novak']",
+        "_FAKE_CITY = ['London', 'Paris', 'Berlin', 'Madrid', 'Rome', 'Moscow', 'Tokyo', 'Austin', 'Denver', 'Boston', 'Toronto', 'Sydney', 'Oslo', 'Prague', 'Vienna', 'Dublin']",
+        "_FAKE_COUNTRY = ['USA', 'UK', 'Germany', 'France', 'Spain', 'Italy', 'Russia', 'Japan', 'Canada', 'Australia', 'Norway', 'Brazil', 'India', 'Poland', 'Sweden', 'Ireland']",
+        "_FAKE_STREET = ['Main St', 'Oak Ave', 'Pine Rd', 'Maple Dr', 'Cedar Ln', 'Elm St', 'Park Ave', 'Lake Rd', 'Hill St', 'River Rd', 'King St', 'Queen St']",
+        "_FAKE_DOMAIN = ['example.com', 'mail.com', 'test.org', 'demo.net', 'acme.io', 'sample.co', 'inbox.com', 'fastmail.dev']",
+        "_FAKE_LOREM = 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud'.split()",
+        "",
+        "",
+        "def _fake(kind, args):",
+        "    '''Synthetic data generator for ${fake:kind[:args]} placeholders.'''",
+        "    if kind in ('first_name', 'firstname'):",
+        "        return random.choice(_FAKE_FIRST)",
+        "    if kind in ('last_name', 'lastname'):",
+        "        return random.choice(_FAKE_LAST)",
+        "    if kind in ('name', 'full_name', 'fullname'):",
+        "        return random.choice(_FAKE_FIRST) + ' ' + random.choice(_FAKE_LAST)",
+        "    if kind == 'username':",
+        "        return (random.choice(_FAKE_FIRST) + '.' + random.choice(_FAKE_LAST)).lower() + str(random.randint(1, 999))",
+        "    if kind == 'email':",
+        "        user = (random.choice(_FAKE_FIRST) + '.' + random.choice(_FAKE_LAST)).lower()",
+        "        return user + str(random.randint(1, 9999)) + '@' + random.choice(_FAKE_DOMAIN)",
+        "    if kind == 'domain':",
+        "        return random.choice(_FAKE_DOMAIN)",
+        "    if kind == 'phone':",
+        "        return '+1-{:03d}-{:03d}-{:04d}'.format(random.randint(200, 999), random.randint(200, 999), random.randint(0, 9999))",
+        "    if kind == 'city':",
+        "        return random.choice(_FAKE_CITY)",
+        "    if kind == 'country':",
+        "        return random.choice(_FAKE_COUNTRY)",
+        "    if kind == 'address':",
+        "        return str(random.randint(1, 9999)) + ' ' + random.choice(_FAKE_STREET)",
+        "    if kind == 'word':",
+        "        return random.choice(_FAKE_LOREM)",
+        "    if kind == 'words':",
+        "        try:",
+        "            n = int(args) if args else 3",
+        "        except ValueError:",
+        "            n = 3",
+        "        return ' '.join(random.choice(_FAKE_LOREM) for _ in range(max(1, n)))",
+        "    if kind == 'sentence':",
+        "        words = [random.choice(_FAKE_LOREM) for _ in range(random.randint(4, 9))]",
+        "        return words[0].capitalize() + ' ' + ' '.join(words[1:]) + '.'",
+        "    if kind == 'digits':",
+        "        try:",
+        "            n = int(args) if args else 6",
+        "        except ValueError:",
+        "            n = 6",
+        "        return ''.join(str(random.randint(0, 9)) for _ in range(max(1, n)))",
+        "    if kind == 'bool':",
+        "        return random.choice(('true', 'false'))",
+        "    return ''",
+        "",
+        "",
+        "def _resolve_static(value):",
+        "    '''Resolve ${fake:}, ${env:} and builtin function placeholders without a user context.'''",
+        "    if not isinstance(value, str):",
+        "        return value",
+        "",
+        "    def replace(match):",
+        "        key = match.group(1)",
+        "        if key.startswith('fake:'):",
+        "            kind, _, fargs = key[5:].partition(':')",
+        "            return _fake(kind, fargs)",
+        "        if key.startswith('env:'):",
+        "            name, default = _parse_env_ref(key[4:])",
+        "            return os.environ.get(name, default)",
+        "        func_name, _, func_args = key.partition(':')",
+        "        if func_name in _RUNTIME_FUNCTIONS:",
+        "            return _call_function(func_name, func_args)",
+        "        return ''",
+        "",
+        "    return _PLACEHOLDER_RE.sub(replace, value)",
+        "",
     ]
 
 
@@ -172,7 +247,16 @@ def _emit_data_layer(data_specs: Dict[str, Dict[str, Any]]) -> List[str]:
         "            return _DATA_POOLS[name]",
         "        spec = _DATA_SPECS.get(name) or {}",
         "        rows = []",
-        "        if spec.get('inline') is not None:",
+        "        generate = spec.get('generate')",
+        "        if generate is not None:",
+        "            count = generate.get('count', 100)",
+        "            try:",
+        "                count = int(count)",
+        "            except (TypeError, ValueError):",
+        "                count = 100",
+        "            fields = generate.get('fields') or {}",
+        "            rows = [{k: _resolve_static(v) for k, v in fields.items()} for _ in range(max(0, count))]",
+        "        elif spec.get('inline') is not None:",
         "            rows = [row for row in spec['inline'] if isinstance(row, dict)]",
         "        else:",
         "            path = spec.get('source') or ''",
@@ -217,6 +301,7 @@ def _emit_runtime_mixin() -> List[str]:
         "            ${env:NAME}         - environment variable",
         "            ${env:NAME:-def}    - environment variable with default",
         "            ${data:pool.field}  - field of this user's data pool row",
+        "            ${fake:name}        - synthetic data (name, email, city, words:N, digits:N, ...)",
         "            ${NAME}             - captured variable, then env variable",
         "            ${timestamp}        - current timestamp ms",
         "            ${random}           - random string (${random:N} for length N)",
@@ -241,6 +326,9 @@ def _emit_runtime_mixin() -> List[str]:
         "            if key.startswith('data:'):",
         "                pool_name, _, field_path = key[5:].partition('.')",
         "                return self._data_value(pool_name, field_path)",
+        "            if key.startswith('fake:'):",
+        "                kind, _, fake_args = key[5:].partition(':')",
+        "                return _fake(kind, fake_args)",
         "            func_name, _, func_args = key.partition(':')",
         "            if func_name in _RUNTIME_FUNCTIONS:",
         "                return _call_function(func_name, func_args)",
@@ -434,7 +522,31 @@ class ScenarioGenerator:
                 )
             source = spec.get("source")
             inline = spec.get("inline")
-            if inline is not None:
+            generate = spec.get("generate")
+            if generate is not None:
+                if not isinstance(generate, dict):
+                    raise ValueError(
+                        f"{self.section_prefix}.data.{pool_name}.generate must be an object"
+                    )
+                fields = generate.get("fields")
+                if not isinstance(fields, dict) or not fields:
+                    raise ValueError(
+                        f"{self.section_prefix}.data.{pool_name}.generate.fields "
+                        "must be a non-empty object"
+                    )
+                count = generate.get("count", 100)
+                try:
+                    count = int(count)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"{self.section_prefix}.data.{pool_name}.generate.count must be an integer"
+                    )
+                if count < 1:
+                    raise ValueError(
+                        f"{self.section_prefix}.data.{pool_name}.generate.count must be >= 1"
+                    )
+                generate = {"count": count, "fields": {str(k): v for k, v in fields.items()}}
+            elif inline is not None:
                 if not isinstance(inline, list) or not all(
                     isinstance(row, dict) for row in inline
                 ):
@@ -443,7 +555,8 @@ class ScenarioGenerator:
                     )
             elif not (isinstance(source, str) and source.strip()):
                 raise ValueError(
-                    f"{self.section_prefix}.data.{pool_name} must define 'source' (file path) or 'inline' (rows)"
+                    f"{self.section_prefix}.data.{pool_name} must define 'source' (file path), "
+                    "'inline' (rows), or 'generate' (synthetic)"
                 )
             mode = str(spec.get("mode", "unique_per_user"))
             if mode not in DATA_MODES:
@@ -454,6 +567,7 @@ class ScenarioGenerator:
             specs[pool_name] = {
                 "source": source if isinstance(source, str) else None,
                 "inline": inline,
+                "generate": generate,
                 "mode": mode,
             }
         self.data_specs = specs

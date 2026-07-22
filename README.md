@@ -191,8 +191,30 @@ String values in the config support runtime placeholders — resolved at request
 | `${choice:a,b,c}` | Random element of a comma-separated list |
 | `${now:%Y-%m-%d}` | Current time via `strftime` format (colons allowed: `${now:%H:%M}`); `${now}` — ISO format |
 | `${iteration}` | Request counter across the run: 1, 2, 3, ... — increments on every call by any virtual user. Useful for unique data: `"name": "user-${iteration}"` |
+| `${fake:KIND}` | Synthetic data (see below): `${fake:name}`, `${fake:email}`, `${fake:city}`, ... |
 
 Function names (`timestamp`, `random`, `iteration`, `uuid`, `randint`, `choice`, `now`) are reserved — an environment variable with the same name cannot be referenced as a bare `${name}` (use `${env:name}` instead). Invalid function arguments degrade gracefully (defaults or empty string) instead of crashing the run.
+
+### Synthetic data (`${fake:...}`)
+
+For realistic payloads without preparing a dataset, use the `fake:` namespace. Each reference produces a new synthetic value at request time:
+
+| Placeholder | Example output |
+|-------------|----------------|
+| `${fake:first_name}` / `${fake:last_name}` | `Anna` / `Petrov` |
+| `${fake:name}` | `Anna Petrov` |
+| `${fake:username}` | `anna.petrov42` |
+| `${fake:email}` | `anna.petrov1234@example.com` |
+| `${fake:domain}` | `acme.io` |
+| `${fake:phone}` | `+1-415-555-0132` |
+| `${fake:city}` / `${fake:country}` | `Berlin` / `Germany` |
+| `${fake:address}` | `742 Oak Ave` |
+| `${fake:word}` / `${fake:words:N}` | `lorem` / `lorem ipsum dolor` |
+| `${fake:sentence}` | `Lorem ipsum dolor sit amet.` |
+| `${fake:digits:N}` | `${fake:digits:5}` → `40718` |
+| `${fake:bool}` | `true` / `false` |
+
+The `fake:` namespace never collides with your environment or captured variables. Unknown kinds resolve to an empty string. Values are independent per reference — if you need a *consistent* synthetic identity per virtual user (same name and email across a whole flow), use a **generated data pool** (below).
 
 Placeholders also work in `path` — e.g. `"path": "/users/${var:user_id}"`. The request `name` keeps the template string, so Locust stats group all calls of the endpoint into one row regardless of the substituted values.
 
@@ -306,6 +328,17 @@ Data pools feed requests with rows from CSV/JSON files (or inline lists) — e.g
           {"id": "2", "sku": "B-200"}
         ],
         "mode": "random"
+      },
+      "people": {
+        "generate": {                        // synthetic pool — no file needed
+          "count": 1000,                     // number of rows to generate
+          "fields": {                        // each field is a placeholder template
+            "email": "${fake:email}",
+            "full_name": "${fake:name}",
+            "user_id": "${uuid}"
+          }
+        },
+        "mode": "unique_per_user"
       }
     },
     "on_start": [
@@ -329,6 +362,8 @@ Data pools feed requests with rows from CSV/JSON files (or inline lists) — e.g
 ```
 
 `${data:pool.field}` resolves a field of a row; nested JSON fields use dot paths (`${data:accounts.profile.city}`).
+
+A pool draws its rows from exactly one source: `source` (a CSV/JSON file), `inline` (rows in the config), or `generate` (synthetic rows built from `${fake:...}` and other placeholders). A generated pool gives each virtual user a **consistent synthetic identity** — the same generated email, name and id across the whole scenario — which pure `${fake:...}` placeholders (fresh value every reference) cannot.
 
 | Mode | Row selection |
 |------|---------------|

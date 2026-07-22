@@ -201,6 +201,17 @@ def generate_template(
                 "accounts": {
                     "source": "data/accounts.csv",
                     "mode": "unique_per_user"
+                },
+                "people": {
+                    "_comment": "Synthetic pool: consistent fake identity per user, no file needed",
+                    "generate": {
+                        "count": 1000,
+                        "fields": {
+                            "email": "${fake:email}",
+                            "full_name": "${fake:name}"
+                        }
+                    },
+                    "mode": "unique_per_user"
                 }
             },
             "_flows_example": [

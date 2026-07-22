@@ -17,7 +17,7 @@ _ENV_RE = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 _RUNTIME_PLACEHOLDERS = RUNTIME_FUNCTIONS
 
 # Namespaced placeholders resolved at runtime (captured variables, data pools).
-_RUNTIME_NAMESPACES = ("var:", "data:")
+_RUNTIME_NAMESPACES = ("var:", "data:", "fake:")
 
 
 def _parse_env_ref(ref: str) -> tuple:

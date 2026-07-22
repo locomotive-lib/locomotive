@@ -1019,7 +1019,7 @@ class TestDataPoolValidation:
 
     def test_no_source_no_inline_raises(self, tmp_path):
         gen = self._gen({"accounts": {"mode": "random"}})
-        with pytest.raises(ValueError, match="'source'.*or 'inline'"):
+        with pytest.raises(ValueError, match="must define 'source'.*'generate'"):
             gen.generate(tmp_path)
 
     def test_bad_pool_name_raises(self, tmp_path):
@@ -1230,3 +1230,196 @@ class TestPersonaDataPools:
         ]
         with pytest.raises(ValueError, match="defined differently"):
             generate_locustfile({}, {}, tmp_path, users=users)
+
+
+# ── synthetic data: ${fake:...} generators ────────────────────────────
+
+
+class TestFakeGenerators:
+    def _user(self, tmp_path):
+        scenario = {"requests": [{"name": "P", "method": "GET", "path": "/p"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        return _make_user(ns)
+
+    def test_name_has_two_parts(self, tmp_path):
+        user = self._user(tmp_path)
+        parts = user._resolve("${fake:name}").split(" ")
+        assert len(parts) == 2 and all(p.isalpha() for p in parts)
+
+    def test_first_and_last_name(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${fake:first_name}").isalpha()
+        assert user._resolve("${fake:last_name}").isalpha()
+
+    def test_email_format(self, tmp_path):
+        user = self._user(tmp_path)
+        email = user._resolve("${fake:email}")
+        assert email.count("@") == 1
+        local, domain = email.split("@")
+        assert local and "." in domain
+
+    def test_username_nonempty(self, tmp_path):
+        user = self._user(tmp_path)
+        assert len(user._resolve("${fake:username}")) > 0
+
+    def test_phone_pattern(self, tmp_path):
+        import re as _re
+        user = self._user(tmp_path)
+        assert _re.fullmatch(r"\+1-\d{3}-\d{3}-\d{4}", user._resolve("${fake:phone}"))
+
+    def test_digits_length(self, tmp_path):
+        user = self._user(tmp_path)
+        val = user._resolve("${fake:digits:5}")
+        assert len(val) == 5 and val.isdigit()
+
+    def test_digits_default(self, tmp_path):
+        user = self._user(tmp_path)
+        assert len(user._resolve("${fake:digits}")) == 6
+
+    def test_words_count(self, tmp_path):
+        user = self._user(tmp_path)
+        assert len(user._resolve("${fake:words:4}").split(" ")) == 4
+
+    def test_sentence_ends_with_period(self, tmp_path):
+        user = self._user(tmp_path)
+        s = user._resolve("${fake:sentence}")
+        assert s.endswith(".") and s[0].isupper()
+
+    def test_bool(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${fake:bool}") in {"true", "false"}
+
+    def test_city_country_address(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${fake:city}").strip()
+        assert user._resolve("${fake:country}").strip()
+        assert user._resolve("${fake:address}")[0].isdigit()
+
+    def test_unknown_kind_empty(self, tmp_path):
+        user = self._user(tmp_path)
+        assert user._resolve("${fake:nonsense}") == ""
+
+    def test_variety_across_calls(self, tmp_path):
+        user = self._user(tmp_path)
+        emails = {user._resolve("${fake:email}") for _ in range(20)}
+        assert len(emails) > 1  # not all identical
+
+    def test_fake_reserved_over_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("fake:email", "should-not-be-read")
+        user = self._user(tmp_path)
+        assert "@" in user._resolve("${fake:email}")
+
+    def test_fake_inside_request_body(self, tmp_path):
+        scenario = {
+            "requests": [
+                {"name": "Reg", "method": "POST", "path": "/register",
+                 "json": {"email": "${fake:email}", "name": "${fake:name}"}}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.task_1_reg()
+        body = user.client.calls[-1]["json"]
+        assert "@" in body["email"] and " " in body["name"]
+
+
+# ── synthetic data: generated data pools ──────────────────────────────
+
+
+class TestGeneratedPools:
+    def _scenario(self, count=50, mode="unique_per_user"):
+        return {
+            "data": {
+                "people": {
+                    "generate": {
+                        "count": count,
+                        "fields": {
+                            "email": "${fake:email}",
+                            "full_name": "${fake:name}",
+                            "user_id": "${uuid}",
+                        },
+                    },
+                    "mode": mode,
+                }
+            },
+            "requests": [
+                {"name": "Reg", "method": "POST", "path": "/register",
+                 "json": {"email": "${data:people.email}", "name": "${data:people.full_name}"}}
+            ],
+        }
+
+    def test_pool_generates_count_rows(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._scenario(count=25))
+        rows = ns["_load_pool"]("people")
+        assert len(rows) == 25
+        assert all("@" in r["email"] and r["user_id"] for r in rows)
+
+    def test_consistent_row_per_user(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._scenario())
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_reg()
+        first = user.client.calls[-1]["json"]
+        user.task_1_reg()
+        second = user.client.calls[-1]["json"]
+        assert first == second  # same user keeps its synthetic identity
+
+    def test_unique_per_user_distinct(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._scenario(count=50))
+        emails = set()
+        for _ in range(5):
+            u = _make_user(ns)
+            u.on_start()
+            u.task_1_reg()
+            emails.add(u.client.calls[-1]["json"]["email"])
+        assert len(emails) == 5  # distinct rows (count >> users)
+
+    def test_generated_pool_in_flow(self, tmp_path):
+        scenario = {
+            "data": {"acc": {"generate": {"count": 10, "fields": {"login": "${fake:username}"}}, "mode": "once"}},
+            "flows": [
+                {"name": "F", "steps": [
+                    {"name": "S", "method": "POST", "path": "/login",
+                     "json": {"u": "${data:acc.login}"}}
+                ]}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        flow = _make_flow(ns, "Flow_1_f", user)
+        flow.step_1_s()
+        assert user.client.calls[-1]["json"]["u"]
+
+
+class TestGeneratedPoolValidation:
+    def _gen(self, data):
+        return ScenarioGenerator(
+            {"data": data, "requests": [{"name": "P", "method": "GET", "path": "/p"}]},
+            {},
+        )
+
+    def test_generate_without_fields_raises(self, tmp_path):
+        gen = self._gen({"p": {"generate": {"count": 5}}})
+        with pytest.raises(ValueError, match="generate.fields must be a non-empty object"):
+            gen.generate(tmp_path)
+
+    def test_generate_empty_fields_raises(self, tmp_path):
+        gen = self._gen({"p": {"generate": {"fields": {}}}})
+        with pytest.raises(ValueError, match="generate.fields"):
+            gen.generate(tmp_path)
+
+    def test_generate_bad_count_raises(self, tmp_path):
+        gen = self._gen({"p": {"generate": {"fields": {"a": "${uuid}"}, "count": "lots"}}})
+        with pytest.raises(ValueError, match="generate.count must be an integer"):
+            gen.generate(tmp_path)
+
+    def test_generate_zero_count_raises(self, tmp_path):
+        gen = self._gen({"p": {"generate": {"fields": {"a": "${uuid}"}, "count": 0}}})
+        with pytest.raises(ValueError, match="generate.count must be >= 1"):
+            gen.generate(tmp_path)
+
+    def test_generate_not_object_raises(self, tmp_path):
+        gen = self._gen({"p": {"generate": "nope"}})
+        with pytest.raises(ValueError, match="generate must be an object"):
+            gen.generate(tmp_path)
