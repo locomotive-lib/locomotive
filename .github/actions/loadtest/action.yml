@@ -79,7 +79,7 @@ runs:
         fi
 
         python3 -m pip install --quiet --upgrade pip
-        python3 -m pip install --quiet locomotive locust
+        python3 -m pip install --quiet --upgrade locomotive locust
 
         echo "Installed:"
         python3 -m pip show locomotive | grep -E "Name|Version" || true
