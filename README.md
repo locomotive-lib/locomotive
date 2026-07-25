@@ -17,6 +17,7 @@ A Python library and CLI for integrating load testing into CI/CD pipelines. Powe
 - **Gate checks** — threshold-based metric validation (error rate, latency, RPS)
 - **HTML reports** — visual results with charts, deltas, and customizable themes
 - **GitHub Actions ready** — built-in Action for CI/CD integration, PR comments, artifact uploads, and pipeline gating
+- **Config validation** — `loco validate` catches structural and semantic mistakes (uncaptured `${var:}`, undeclared data pools, ...) before a run; runs automatically in `run`/`ci`
 - **YAML & JSON configs** — both formats supported (`.json`, `.yml`, `.yaml`)
 
 ## Installation
@@ -1010,13 +1011,23 @@ loco init [--openapi spec.json] [--host URL] [--github-workflow] [--output FILE]
 | `--github-workflow` | Also create `.github/workflows/loadtest.yml` |
 | `--force` / `-f` | Overwrite existing files |
 
+### `loco validate` — check the config
+
+```bash
+loco --config loconfig.json validate
+```
+
+Statically checks the config without running Locust and reports every problem at once, with precise locations. **Errors** block (bad structure — missing `path`, invalid data `mode`, unknown `auth.type`, no scenario source); **warnings** flag likely mistakes (`${var:x}` that nothing captures, `${data:pool}` not declared, `_requires_auth` with no `auth` block, unknown analysis metric). Exit code is `1` if there are errors, `0` otherwise.
+
+Validation also runs automatically at the start of `loco run` and `loco ci` — a broken config fails fast with a clear message instead of deep inside Locust. Pass `--no-validate` to skip it.
+
 ### `loco ci` — full pipeline
 
 ```bash
 loco --config loconfig.json ci [--set-baseline] [--users N] [--run-time 3m] ...
 ```
 
-Runs test → analysis → report. Accepts all flags from `run`, `analyze`, and `report`.
+Runs test → analysis → report. Accepts all flags from `run`, `analyze`, and `report`. Validates the config first (skip with `--no-validate`).
 
 ### `loco run` — run tests only
 
@@ -1060,6 +1071,7 @@ Additional `run` and `ci` flags:
 | `--set-baseline` | Save as baseline |
 | `--extra-arg` | Extra Locust argument (can be specified multiple times) |
 | `--locust-cmd` | Path to locust binary |
+| `--no-validate` | Skip the static config validation done before running |
 
 Additional `analyze` and `ci` flags:
 

@@ -286,6 +286,28 @@ def _exit_code_for_status(status: str, fail_on: str) -> int:
     return 0
 
 
+def cmd_validate(args: argparse.Namespace, config: Dict[str, Any]) -> int:
+    """Statically validate the config; exit 1 if there are errors."""
+    from .validate import ERROR, format_issues, validate_config
+
+    issues = validate_config(config)
+    print(format_issues(issues))
+    return 1 if any(i.level == ERROR for i in issues) else 0
+
+
+def _preflight_validate(config: Dict[str, Any]) -> int:
+    """Validate before a run. Print issues; return 1 if there are errors."""
+    from .validate import ERROR, format_issues, validate_config
+
+    issues = validate_config(config)
+    if issues:
+        print(format_issues(issues))
+    if any(i.level == ERROR for i in issues):
+        print("Config validation failed. Fix the errors above, or pass --no-validate to skip.")
+        return 1
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Initialize a new loconfig configuration."""
     output_path = Path(args.output)
@@ -317,6 +339,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace, config: Dict[str, Any]) -> int:
+    if not getattr(args, "no_validate", False):
+        code = _preflight_validate(config)
+        if code:
+            return code
     storage = _build_storage(args, config)
     run_id = _build_run_id(args, config)
     locust_config = _build_locust_config(args, config)
@@ -392,6 +418,10 @@ def cmd_report(args: argparse.Namespace, config: Dict[str, Any]) -> int:
 
 def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     """Run full CI pipeline: run tests, analyze, generate report."""
+    if not getattr(args, "no_validate", False):
+        code = _preflight_validate(config)
+        if code:
+            return code
     storage = _build_storage(args, config)
     run_id = _build_run_id(args, config)
     locust_config = _build_locust_config(args, config)
@@ -522,6 +552,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_analyze_args(ci_parser)
     _add_report_args(ci_parser)
 
+    # validate command
+    subparsers.add_parser("validate", help="Statically validate the config without running")
+
     return parser
 
 
@@ -537,6 +570,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--extra-arg", action="append", help="Extra arguments to pass to locust")
     parser.add_argument("--locust-cmd", help="Custom locust command")
     parser.add_argument("--set-baseline", action="store_true", help="Set this run as baseline")
+    parser.add_argument("--no-validate", action="store_true", help="Skip static config validation before running")
 
 
 def _add_storage_args(parser: argparse.ArgumentParser) -> None:
@@ -570,6 +604,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Run 'loco init' to create a default config.")
         return 1
 
+    if args.command == "validate":
+        return cmd_validate(args, config)
     if args.command == "run":
         return cmd_run(args, config)
     if args.command == "analyze":
