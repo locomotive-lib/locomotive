@@ -18,6 +18,7 @@ A Python library and CLI for integrating load testing into CI/CD pipelines. Powe
 - **HTML reports** — visual results with charts, deltas, and customizable themes
 - **GitHub Actions ready** — built-in Action for CI/CD integration, PR comments, artifact uploads, and pipeline gating
 - **Config validation** — `loco validate` catches structural and semantic mistakes (uncaptured `${var:}`, undeclared data pools, ...) before a run; runs automatically in `run`/`ci`
+- **Spec drift detection** — `loco diff --openapi spec.json` shows how the config drifted from a changed API contract (removed / changed / added endpoints)
 - **YAML & JSON configs** — both formats supported (`.json`, `.yml`, `.yaml`)
 
 ## Installation
@@ -120,6 +121,22 @@ loco --config loconfig.json ci --set-baseline
 Every generated request and step carries an `_operation` field (the operationId) — kept for provenance and future spec-vs-config reconciliation.
 
 Everything is a starting point: values the tool can't infer are marked with `_comment` TODOs (unknown token field, path params to fill, step order to review). Review and adjust, then run. Use `--host` to set the target URL.
+
+## Keeping the config in sync (`loco diff`)
+
+APIs change. `loco diff --openapi spec.json` compares your config against the current spec and shows exactly what drifted — so a contract change means updating the config, not regenerating and re-adapting it from scratch.
+
+```bash
+loco --config loconfig.json diff --openapi openapi.json
+```
+
+It reports three kinds of drift, with breaking ones marked `!`:
+
+- **REMOVED** (breaking) — the config calls an endpoint that's no longer in the spec (removed or renamed). Your test would hit a dead route.
+- **CHANGED** (breaking / info) — a matched endpoint whose contract shifted: the spec now requires a body field or query param the request is missing (breaking), or the request sends a field the spec dropped (info).
+- **ADDED** (info) — a spec endpoint the config doesn't cover yet, suggested for adding.
+
+Requests are matched to spec operations first by `_operation` (the operationId stamped during generation), then by method + path (params canonicalized), so renamed paths are still tracked as long as the operationId is stable. Exit code is `1` when there's breaking drift (use it as a CI gate) and `0` otherwise; `--exit-zero` makes it report-only.
 
 ## Configuration
 
@@ -1020,6 +1037,14 @@ loco --config loconfig.json validate
 Statically checks the config without running Locust and reports every problem at once, with precise locations. **Errors** block (bad structure — missing `path`, invalid data `mode`, unknown `auth.type`, no scenario source); **warnings** flag likely mistakes (`${var:x}` that nothing captures, `${data:pool}` not declared, `_requires_auth` with no `auth` block, unknown analysis metric). Exit code is `1` if there are errors, `0` otherwise.
 
 Validation also runs automatically at the start of `loco run` and `loco ci` — a broken config fails fast with a clear message instead of deep inside Locust. Pass `--no-validate` to skip it.
+
+### `loco diff` — check against a spec
+
+```bash
+loco --config loconfig.json diff --openapi openapi.json [--exit-zero]
+```
+
+Compares the config against an OpenAPI spec and reports drift (removed / changed / added endpoints). See [Keeping the config in sync](#keeping-the-config-in-sync-loco-diff). Exit `1` on breaking drift.
 
 ### `loco ci` — full pipeline
 

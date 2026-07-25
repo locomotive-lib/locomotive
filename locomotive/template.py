@@ -99,8 +99,9 @@ def generate_template(
         on_start = scaffold.get("on_start")
         flows = scaffold.get("flows")
 
-    # If no requests from OpenAPI, add example placeholders
-    if not requests:
+    # If the spec produced no requests AND no flows, add example placeholders.
+    # (When endpoints fold into flows, an empty flat request list is expected.)
+    if not requests and not flows:
         requests = [
             {
                 "name": "Health Check",

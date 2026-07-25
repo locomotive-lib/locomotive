@@ -687,3 +687,46 @@ def scaffold_scenario(spec: Dict[str, Any], required_only: bool = False) -> Dict
 
     result["requests"] = [r for r in requests if not _is_consumed(r)]
     return result
+
+
+# ── normalized operations (for loco diff) ─────────────────────────────
+
+
+def _canonical_path(path: str) -> str:
+    """Collapse OpenAPI path params to '*' so paths can be compared."""
+    return re.sub(r"\{[^{}]+\}", "*", path)
+
+
+def spec_operations(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalized operations from a spec, for spec-vs-config diffing.
+
+    Each entry: operation_id, method, path, canonical (path with params ->
+    '*'), body_fields, required_body, required_query.
+    """
+    operations: List[Dict[str, Any]] = []
+    for path, item in (spec.get("paths") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        common = item.get("parameters") or []
+        for method in _HTTP_METHODS:
+            operation = item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            body_schema = _request_body_schema(operation, spec)
+            body_schema = resolve(body_schema, spec) if body_schema else {}
+            props = body_schema.get("properties") or {}
+            params = _collect_params(operation, common, spec)
+            required_query = {
+                p.get("name") for p in params
+                if p.get("in") == "query" and p.get("required") and p.get("name")
+            }
+            operations.append({
+                "operation_id": operation.get("operationId") or "",
+                "method": method.upper(),
+                "path": path,
+                "canonical": _canonical_path(path),
+                "body_fields": set(props.keys()),
+                "required_body": set(body_schema.get("required") or []),
+                "required_query": required_query,
+            })
+    return operations

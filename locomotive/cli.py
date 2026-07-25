@@ -295,6 +295,23 @@ def cmd_validate(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     return 1 if any(i.level == ERROR for i in issues) else 0
 
 
+def cmd_diff(args: argparse.Namespace, config: Dict[str, Any]) -> int:
+    """Compare the config against an OpenAPI spec; exit 1 on breaking drift."""
+    from .diff import diff_config_spec, format_findings, has_breaking
+    from .openapi import load_spec
+
+    spec_path = Path(args.openapi)
+    if not spec_path.exists():
+        print(f"Error: OpenAPI spec not found: {spec_path}")
+        return 1
+    spec = load_spec(spec_path)
+    findings = diff_config_spec(config, spec)
+    print(format_findings(findings))
+    if args.exit_zero:
+        return 0
+    return 1 if has_breaking(findings) else 0
+
+
 def _preflight_validate(config: Dict[str, Any]) -> int:
     """Validate before a run. Print issues; return 1 if there are errors."""
     from .validate import ERROR, format_issues, validate_config
@@ -555,6 +572,11 @@ def build_parser() -> argparse.ArgumentParser:
     # validate command
     subparsers.add_parser("validate", help="Statically validate the config without running")
 
+    # diff command
+    diff_parser = subparsers.add_parser("diff", help="Compare the config against an OpenAPI spec")
+    diff_parser.add_argument("--openapi", required=True, help="Path to the OpenAPI spec to compare against")
+    diff_parser.add_argument("--exit-zero", action="store_true", help="Always exit 0 (report only, don't fail on breaking drift)")
+
     return parser
 
 
@@ -606,6 +628,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "validate":
         return cmd_validate(args, config)
+    if args.command == "diff":
+        return cmd_diff(args, config)
     if args.command == "run":
         return cmd_run(args, config)
     if args.command == "analyze":
