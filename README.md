@@ -12,7 +12,7 @@ A Python library and CLI for integrating load testing into CI/CD pipelines. Powe
 
 ## Features
 
-- **OpenAPI generation** — `loco init --openapi openapi.json` scaffolds a config from your API spec
+- **Smart OpenAPI generation** — `loco init --openapi openapi.json` builds a near-runnable config: request bodies filled from schemas, auth detected, login + multi-step flows inferred
 - **Baseline comparison** — regression analysis of performance metrics across runs
 - **Gate checks** — threshold-based metric validation (error rate, latency, RPS)
 - **HTML reports** — visual results with charts, deltas, and customizable themes
@@ -44,7 +44,7 @@ loco init --github-workflow
 
 | Flag | Description |
 |------|-------------|
-| `--openapi FILE` | Path to OpenAPI spec — endpoints will be converted to requests |
+| `--openapi FILE` | Path to OpenAPI spec — see [Generating from OpenAPI](#generating-from-openapi) |
 | `--host URL` | Service URL (default: `http://localhost:8000`) |
 | `--output FILE` / `-o` | Output file path (default: `loconfig.json`) |
 | `--github-workflow` | Also create `.github/workflows/loadtest.yml` |
@@ -95,6 +95,30 @@ loco --config loconfig.json ci
 # Save baseline for future comparisons
 loco --config loconfig.json ci --set-baseline
 ```
+
+## Generating from OpenAPI
+
+`loco init --openapi spec.json` reads your OpenAPI 3.x spec (JSON or YAML) and produces a config that is close to runnable — not a bag of `TODO` stubs. Instead of hand-writing scenarios, you edit a scaffold that already reflects your API.
+
+**Request bodies are synthesized from the schema.** Each field is filled with a sensible placeholder, chosen in this priority: the schema's own `example`/`default` → `enum` (`${choice:...}`) → `format` (email, uuid, date-time, ...) → the field name (`email`, `phone`, `first_name`, `password`, `quantity`, `*_id`, ...) → the JSON type. Explicit `minimum`/`maximum` become `${randint:min:max}`. `$ref`, `allOf`, and nested objects/arrays are resolved.
+
+```jsonc
+// POST body schema { product_id: integer, quantity: integer(1..5), customer_email: string(email) }
+// becomes:
+"json": {
+  "product_id": "${randint:1:1000}",
+  "quantity": "${randint:1:5}",
+  "customer_email": "${fake:email}"
+}
+```
+
+**Auth is detected from `securitySchemes`.** A bearer/OAuth2 scheme becomes `auth: {type: bearer, ...}`, `basic` and header `apiKey` are mapped too. If the spec has a login-looking endpoint (`/login`, `/auth/...`, `/token`, ...), Locomotive wires an `on_start` step that logs in and captures the token — inferring the token field from the login response schema (e.g. `data.access_token`) — and sets `auth.token` to `${var:token}`. Login credentials map to `${TEST_USER}` / `${TEST_PASSWORD}` (set them as CI secrets).
+
+**Multi-step flows are inferred from CRUD paths.** When a resource has a `POST /orders` (create) plus item operations (`GET/PUT/DELETE /orders/{id}`, sub-actions like `POST /orders/{id}/pay`), Locomotive builds a flow: the create step captures the new id from its response, and later steps use `${var:id}` in the path. Collection reads (`GET /orders`) stay as flat requests; login and flow operations are removed from the flat request list so nothing runs twice.
+
+Every generated request and step carries an `_operation` field (the operationId) — kept for provenance and future spec-vs-config reconciliation.
+
+Everything is a starting point: values the tool can't infer are marked with `_comment` TODOs (unknown token field, path params to fill, step order to review). Review and adjust, then run. Use `--host` to set the target URL.
 
 ## Configuration
 
@@ -980,7 +1004,7 @@ loco init [--openapi spec.json] [--host URL] [--github-workflow] [--output FILE]
 
 | Flag | Description |
 |------|-------------|
-| `--openapi FILE` | Path to OpenAPI spec — endpoints will be converted to requests |
+| `--openapi FILE` | Path to OpenAPI spec — see [Generating from OpenAPI](#generating-from-openapi) |
 | `--host URL` | Service URL (default: `http://localhost:8000`) |
 | `--output FILE` / `-o` | Output config path (default: `loconfig.json`) |
 | `--github-workflow` | Also create `.github/workflows/loadtest.yml` |
