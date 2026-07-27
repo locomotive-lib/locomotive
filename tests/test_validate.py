@@ -123,6 +123,35 @@ class TestDataAndAuth:
         assert _has(validate_config(cfg), ERROR, "'auth.type' must be one of")
 
 
+class TestExpectValidation:
+    def _cfg(self, expect):
+        return {"scenario": {"requests": [
+            {"name": "C", "method": "GET", "path": "/c", "expect": expect}]}}
+
+    def test_valid_expect_ok(self):
+        cfg = self._cfg({"status": [200, 201], "contains": "ok",
+                         "json": {"data.id": "1"}, "max_ms": 500})
+        assert not any(i.level == ERROR for i in validate_config(cfg))
+
+    def test_expect_not_object(self):
+        assert _has(validate_config(self._cfg("nope")), ERROR, "'expect' must be an object")
+
+    def test_bad_status(self):
+        assert _has(validate_config(self._cfg({"status": "ok"})), ERROR, "'expect.status'")
+
+    def test_bad_contains(self):
+        assert _has(validate_config(self._cfg({"contains": 123})), ERROR, "'expect.contains'")
+
+    def test_bad_json(self):
+        assert _has(validate_config(self._cfg({"json": ["a"]})), ERROR, "'expect.json'")
+
+    def test_bad_max_ms(self):
+        assert _has(validate_config(self._cfg({"max_ms": "soon"})), ERROR, "'expect.max_ms'")
+
+    def test_unknown_key_warns(self):
+        assert _has(validate_config(self._cfg({"status": 200, "bogus": 1})), WARNING, "unknown 'expect' key")
+
+
 class TestAnalysis:
     def test_bad_rule_mode(self):
         cfg = {"scenario": {"requests": [{"method": "GET", "path": "/x"}]},

@@ -17,6 +17,7 @@ A Python library and CLI for integrating load testing into CI/CD pipelines. Powe
 - **Gate checks** — threshold-based metric validation (error rate, latency, RPS)
 - **HTML reports** — visual results with charts, deltas, and customizable themes
 - **GitHub Actions ready** — built-in Action for CI/CD integration, PR comments, artifact uploads, and pipeline gating
+- **Response assertions** — an `expect` block validates status, body content, JSON fields, and response time; content failures show up in Locust stats and the error-rate gate
 - **Config validation** — `loco validate` catches structural and semantic mistakes (uncaptured `${var:}`, undeclared data pools, ...) before a run; runs automatically in `run`/`ci`
 - **Spec drift detection** — `loco diff --openapi spec.json` shows how the config drifted from a changed API contract (removed / changed / added endpoints)
 - **YAML & JSON configs** — both formats supported (`.json`, `.yml`, `.yaml`)
@@ -309,6 +310,26 @@ Everything is configured declaratively — no need to edit the generated locustf
 Captured values are stored per virtual user and can be referenced from any request — in headers, paths, query, or bodies — as `${auth_token}` or explicitly as `${var:auth_token}`. A bare `${name}` checks captured variables first, then environment variables. If a capture fails (unexpected response shape), the variable resolves to an empty string.
 
 `capture` works in `on_start` requests, in flat `requests`, and in any flow step.
+
+### Response assertions (`expect`)
+
+By default a request counts as a failure only when the HTTP client raises or the server returns a 5xx-style error. Add an `expect` block to any request to also validate the *content* of the response — a 200 that returns the wrong body, or a slow-but-successful call, is then reported as a failure in Locust's stats (and counts toward the error-rate gate):
+
+```jsonc
+{
+  "name": "Get order",
+  "method": "GET",
+  "path": "/orders/${var:order_id}",
+  "expect": {
+    "status": [200, 304],                 // allowed status code(s); int or list
+    "contains": "order",                   // substring(s) the body must contain; str or list
+    "json": {"data.status": "paid"},       // JSON fields by dot-path (loose string compare)
+    "max_ms": 800                          // fail if the response took longer than 800ms
+  }
+}
+```
+
+Every key is optional; a request fails if *any* stated expectation is not met, and the failure message lists all mismatches at once (e.g. `status 500 not in [200]; body is missing 'order'`). Values in `expect` go through the same placeholder resolution as the rest of the request, so `"contains": "${var:order_id}"` or `"json": {"user.email": "${data:accounts.email}"}` work as expected. `expect` is available on flat `requests`, on `on_start`/`on_stop`, and on any flow step. `loco validate` checks the shape of every `expect` block before a run.
 
 ## Flows (multi-step user journeys)
 
@@ -1150,6 +1171,14 @@ artifacts/
 
 - Python 3.9+
 
+## Contributing
+
+Contributions are welcome — bug reports, docs, and features alike. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, how to run the tests, and what
+fits the project's scope. For usage questions, please use GitHub Discussions; for
+bugs and feature requests, the issue templates will guide you.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). By contributing you agree your contributions are
+licensed under the same terms (inbound = outbound).

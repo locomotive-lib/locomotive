@@ -132,6 +132,45 @@ def _validate_request(req: Dict[str, Any], loc: str, issues: List[Issue]) -> Non
     capture = req.get("capture")
     if capture is not None and not isinstance(capture, dict):
         issues.append(Issue(ERROR, loc, "'capture' must be an object {name: json.path}"))
+    if "expect" in req:
+        _validate_expect(req["expect"], f"{loc}.expect", issues)
+
+
+_EXPECT_KEYS = {"status", "contains", "json", "max_ms"}
+
+
+def _validate_expect(expect: Any, loc: str, issues: List[Issue]) -> None:
+    if not isinstance(expect, dict):
+        issues.append(Issue(ERROR, loc, "'expect' must be an object with keys "
+                                        "status/contains/json/max_ms"))
+        return
+    unknown = [k for k in expect if k not in _EXPECT_KEYS and not str(k).startswith("_")]
+    if unknown:
+        issues.append(Issue(WARNING, loc, f"unknown 'expect' key(s) {sorted(unknown)}; "
+                                          f"known keys are {sorted(_EXPECT_KEYS)}"))
+    if "status" in expect:
+        status = expect["status"]
+        codes = status if isinstance(status, list) else [status]
+        if not codes or not all(_is_int(c) for c in codes):
+            issues.append(Issue(ERROR, loc, "'expect.status' must be an integer or list of integers"))
+    if "contains" in expect:
+        contains = expect["contains"]
+        items = contains if isinstance(contains, list) else [contains]
+        if not items or not all(isinstance(s, str) for s in items):
+            issues.append(Issue(ERROR, loc, "'expect.contains' must be a string or list of strings"))
+    if "json" in expect and not isinstance(expect["json"], dict):
+        issues.append(Issue(ERROR, loc, "'expect.json' must be an object {dot.path: expected}"))
+    if "max_ms" in expect:
+        max_ms = expect["max_ms"]
+        ok = isinstance(max_ms, (int, float)) and not isinstance(max_ms, bool)
+        if not ok:
+            try:
+                float(max_ms)
+                ok = True
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            issues.append(Issue(ERROR, loc, "'expect.max_ms' must be a number (milliseconds)"))
 
 
 def _validate_data(data: Any, loc: str, issues: List[Issue]) -> None:

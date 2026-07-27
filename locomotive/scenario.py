@@ -379,6 +379,70 @@ def _emit_runtime_mixin() -> List[str]:
         "                value = None",
         "                break",
         "        return '' if value is None else str(value)",
+        "",
+        "    def _assert_response(self, response, expect):",
+        "        '''Check a response against an \"expect\" block.",
+        "",
+        "        Returns a list of human-readable failure messages (empty if the",
+        "        response satisfies every expectation). Supported keys:",
+        "            status:   int or list of ints  - allowed status codes",
+        "            contains: str or list of str   - substrings the body must contain",
+        "            json:     {dot.path: expected} - JSON fields (loose str compare)",
+        "            max_ms:   number               - max response time in milliseconds",
+        "        '''",
+        "        fails = []",
+        "        if not isinstance(expect, dict):",
+        "            return fails",
+        "        status = expect.get('status')",
+        "        if status is not None:",
+        "            allowed = status if isinstance(status, (list, tuple)) else [status]",
+        "            codes = []",
+        "            for s in allowed:",
+        "                try:",
+        "                    codes.append(int(s))",
+        "                except (TypeError, ValueError):",
+        "                    pass",
+        "            if codes and response.status_code not in codes:",
+        "                fails.append('status %s not in %s' % (response.status_code, codes))",
+        "        contains = expect.get('contains')",
+        "        if contains is not None:",
+        "            needles = contains if isinstance(contains, (list, tuple)) else [contains]",
+        "            text = response.text or ''",
+        "            for needle in needles:",
+        "                if str(needle) not in text:",
+        "                    fails.append('body is missing %r' % (str(needle),))",
+        "        json_expect = expect.get('json')",
+        "        if isinstance(json_expect, dict) and json_expect:",
+        "            try:",
+        "                body = response.json()",
+        "            except Exception:",
+        "                body = None",
+        "                fails.append('response body is not valid JSON')",
+        "            if body is not None:",
+        "                for path, expected in json_expect.items():",
+        "                    actual = body",
+        "                    for part in str(path).split('.'):",
+        "                        if isinstance(actual, dict):",
+        "                            actual = actual.get(part)",
+        "                        else:",
+        "                            actual = None",
+        "                            break",
+        "                    if str(actual) != str(expected):",
+        "                        fails.append('json %s: expected %r, got %r' % (path, str(expected), actual))",
+        "        max_ms = expect.get('max_ms')",
+        "        if max_ms is not None:",
+        "            try:",
+        "                limit = float(max_ms)",
+        "            except (TypeError, ValueError):",
+        "                limit = None",
+        "            elapsed_ms = None",
+        "            try:",
+        "                elapsed_ms = response.elapsed.total_seconds() * 1000",
+        "            except Exception:",
+        "                elapsed_ms = None",
+        "            if limit is not None and elapsed_ms is not None and elapsed_ms > limit:",
+        "                fails.append('response took %.0fms > %sms' % (elapsed_ms, max_ms))",
+        "        return fails",
     ]
 
 
@@ -721,25 +785,55 @@ class ScenarioGenerator:
         indent: int,
         user_expr: str = "self",
     ) -> List[str]:
-        """Generate the request call plus optional capture handling."""
+        """Generate the request call plus optional capture / assertion handling.
+
+        Three shapes:
+          - plain request (no capture, no expect): a bare ``client.request(...)``
+          - capture only: assign to ``resp`` and pull captured vars out of json
+          - expect present: wrap in a ``catch_response=True`` block so failed
+            assertions can mark the sample as a failure in Locust's stats
+        """
         pad = " " * indent
         call = self._build_request_call(req, user_expr)
 
         capture = req.get("capture")
-        if not (isinstance(capture, dict) and capture):
-            return [f"{pad}self.client.request({call})"]
+        has_capture = isinstance(capture, dict) and bool(capture)
+        expect = req.get("expect")
+        has_expect = isinstance(expect, dict) and bool(expect)
 
-        lines = [f"{pad}resp = self.client.request({call})"]
-        for var_name, json_path in capture.items():
-            # Simple json path like "token" or "data.access_token"
-            accessor = "data"
-            for part in str(json_path).split("."):
-                accessor += f"[{repr(part)}]"
-            lines.append(f"{pad}try:")
-            lines.append(f"{pad}    data = resp.json()")
-            lines.append(f"{pad}    {user_expr}._vars[{repr(str(var_name))}] = {accessor}")
-            lines.append(f"{pad}except Exception:")
-            lines.append(f"{pad}    {user_expr}._vars[{repr(str(var_name))}] = None")
+        def _capture_lines(resp_pad: str) -> List[str]:
+            out: List[str] = []
+            for var_name, json_path in capture.items():
+                # Simple json path like "token" or "data.access_token"
+                accessor = "data"
+                for part in str(json_path).split("."):
+                    accessor += f"[{repr(part)}]"
+                out.append(f"{resp_pad}try:")
+                out.append(f"{resp_pad}    data = resp.json()")
+                out.append(f"{resp_pad}    {user_expr}._vars[{repr(str(var_name))}] = {accessor}")
+                out.append(f"{resp_pad}except Exception:")
+                out.append(f"{resp_pad}    {user_expr}._vars[{repr(str(var_name))}] = None")
+            return out
+
+        if not has_expect:
+            if not has_capture:
+                return [f"{pad}self.client.request({call})"]
+            lines = [f"{pad}resp = self.client.request({call})"]
+            lines.extend(_capture_lines(pad))
+            return lines
+
+        # expect present: mark the sample success/failure explicitly.
+        inner = pad + "    "
+        lines = [f"{pad}with self.client.request({call}, catch_response=True) as resp:"]
+        if has_capture:
+            lines.extend(_capture_lines(inner))
+        lines.append(
+            f"{inner}_fails = {user_expr}._assert_response(resp, {user_expr}._resolve_dict({repr(expect)}))"
+        )
+        lines.append(f"{inner}if _fails:")
+        lines.append(f"{inner}    resp.failure('; '.join(_fails))")
+        lines.append(f"{inner}else:")
+        lines.append(f"{inner}    resp.success()")
         return lines
 
     def _generate_flow_class(

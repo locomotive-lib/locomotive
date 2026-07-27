@@ -1,4 +1,5 @@
 import base64
+import json
 import sys
 import types
 
@@ -10,26 +11,70 @@ from locomotive.scenario import ScenarioGenerator, _slugify, _safe_int, _safe_fl
 # ── helpers: execute generated code with a stubbed locust ─────────────
 
 
+class _Elapsed:
+    def __init__(self, ms):
+        self._ms = ms
+
+    def total_seconds(self):
+        return self._ms / 1000.0
+
+
 class StubResponse:
-    def __init__(self, payload):
+    """A canned response that also supports Locust's catch_response protocol.
+
+    Usable both directly (``resp = client.request(...)``) and as a context
+    manager (``with client.request(..., catch_response=True) as resp:``).
+    """
+
+    def __init__(self, payload, status_code=200, text=None, elapsed_ms=0.0):
         self._payload = payload
+        self.status_code = status_code
+        if text is None:
+            try:
+                text = json.dumps(payload)
+            except (TypeError, ValueError):
+                text = str(payload)
+        self.text = text
+        self.elapsed = _Elapsed(elapsed_ms)
+        self.succeeded = False
+        self.failed = False
+        self.failure_msg = None
 
     def json(self):
         return self._payload
+
+    def success(self):
+        self.succeeded = True
+
+    def failure(self, msg):
+        self.failed = True
+        self.failure_msg = msg
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class StubClient:
     """Records request() calls; returns a canned JSON payload."""
 
-    def __init__(self, payload=None):
+    def __init__(self, payload=None, status_code=200, text=None, elapsed_ms=0.0):
         self.calls = []
+        self.responses = []
         self._payload = payload if payload is not None else {}
+        self._status_code = status_code
+        self._text = text
+        self._elapsed_ms = elapsed_ms
 
     def request(self, method, url, **kwargs):
         call = {"method": method, "url": url}
         call.update(kwargs)
         self.calls.append(call)
-        return StubResponse(self._payload)
+        resp = StubResponse(self._payload, self._status_code, self._text, self._elapsed_ms)
+        self.responses.append(resp)
+        return resp
 
 
 def _generate(tmp_path, scenario, target=None):
@@ -833,6 +878,128 @@ class TestCaptureInFlatRequests:
         assert user._vars["first"] == "abc"
         user.task_2_use()
         assert user.client.calls[-1]["url"] == "/items/abc"
+
+
+# ── expect: response assertions ───────────────────────────────────────
+
+
+class TestResponseAssertions:
+    def _run(self, tmp_path, expect, payload=None, status_code=200,
+             text=None, elapsed_ms=0.0):
+        scenario = {"requests": [
+            {"name": "Check", "method": "GET", "path": "/check", "expect": expect},
+        ]}
+        ns = _exec_generated(tmp_path, scenario)
+        user = ns["GeneratedUser"]()
+        user.client = StubClient(payload if payload is not None else {},
+                                 status_code=status_code, text=text,
+                                 elapsed_ms=elapsed_ms)
+        user.on_start()
+        user.task_1_check()
+        return user.client.responses[-1]
+
+    def test_generated_uses_catch_response(self, tmp_path):
+        scenario = {"requests": [
+            {"name": "Check", "method": "GET", "path": "/check",
+             "expect": {"status": 200}},
+        ]}
+        content = _generate(tmp_path, scenario)
+        assert "catch_response=True" in content
+        assert "_assert_response" in content
+
+    def test_no_expect_no_catch_response(self, tmp_path):
+        scenario = {"requests": [{"name": "Plain", "method": "GET", "path": "/p"}]}
+        content = _generate(tmp_path, scenario)
+        assert "catch_response=True" not in content
+
+    def test_status_ok(self, tmp_path):
+        resp = self._run(tmp_path, {"status": 200}, status_code=200)
+        assert resp.succeeded and not resp.failed
+
+    def test_status_mismatch_fails(self, tmp_path):
+        resp = self._run(tmp_path, {"status": 200}, status_code=500)
+        assert resp.failed and "status 500" in resp.failure_msg
+
+    def test_status_list(self, tmp_path):
+        resp = self._run(tmp_path, {"status": [200, 201, 204]}, status_code=201)
+        assert resp.succeeded
+
+    def test_contains_ok(self, tmp_path):
+        resp = self._run(tmp_path, {"contains": "hello"}, text="well hello there")
+        assert resp.succeeded
+
+    def test_contains_missing_fails(self, tmp_path):
+        resp = self._run(tmp_path, {"contains": "hello"}, text="goodbye")
+        assert resp.failed and "missing" in resp.failure_msg
+
+    def test_contains_list_all_required(self, tmp_path):
+        resp = self._run(tmp_path, {"contains": ["a", "z"]}, text="abc")
+        assert resp.failed and "'z'" in resp.failure_msg
+
+    def test_json_path_match(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"data.status": "ok"}},
+                         payload={"data": {"status": "ok"}})
+        assert resp.succeeded
+
+    def test_json_path_mismatch_fails(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"data.status": "ok"}},
+                         payload={"data": {"status": "error"}})
+        assert resp.failed and "data.status" in resp.failure_msg
+
+    def test_json_loose_str_compare(self, tmp_path):
+        # int 9 in the body matches expected "9" via str() comparison
+        resp = self._run(tmp_path, {"json": {"id": "9"}}, payload={"id": 9})
+        assert resp.succeeded
+
+    def test_max_ms_ok(self, tmp_path):
+        resp = self._run(tmp_path, {"max_ms": 500}, elapsed_ms=120)
+        assert resp.succeeded
+
+    def test_max_ms_exceeded_fails(self, tmp_path):
+        resp = self._run(tmp_path, {"max_ms": 100}, elapsed_ms=250)
+        assert resp.failed and "250ms" in resp.failure_msg
+
+    def test_multiple_failures_joined(self, tmp_path):
+        resp = self._run(tmp_path, {"status": 200, "contains": "ok"},
+                         status_code=500, text="fail")
+        assert resp.failed and ";" in resp.failure_msg
+
+    def test_placeholder_in_expect_resolved(self, tmp_path):
+        # captured var is available to expect via _resolve_dict
+        scenario = {
+            "on_start": [{"method": "POST", "path": "/login",
+                          "capture": {"want": "id"}}],
+            "requests": [{"name": "Check", "method": "GET", "path": "/check",
+                          "expect": {"contains": "${var:want}"}}],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = ns["GeneratedUser"]()
+        user.client = StubClient({"id": "tok"}, text="body has tok inside")
+        user.on_start()
+        user.task_1_check()
+        assert user.client.responses[-1].succeeded
+
+    def test_expect_with_capture_both_run(self, tmp_path):
+        scenario = {"requests": [
+            {"name": "Check", "method": "GET", "path": "/check",
+             "capture": {"cid": "id"}, "expect": {"status": 200}},
+        ]}
+        ns = _exec_generated(tmp_path, scenario)
+        user = ns["GeneratedUser"]()
+        user.client = StubClient({"id": "xyz"}, status_code=200)
+        user.on_start()
+        user.task_1_check()
+        assert user._vars["cid"] == "xyz"
+        assert user.client.responses[-1].succeeded
+
+    def test_expect_in_flow_step(self, tmp_path):
+        scenario = {"flows": [{"name": "F", "steps": [
+            {"name": "S1", "method": "GET", "path": "/s1",
+             "expect": {"status": 200}},
+        ]}]}
+        content = _generate(tmp_path, scenario)
+        assert "catch_response=True" in content
+        assert "self.user._assert_response" in content
 
 
 # ── D1: data pools ────────────────────────────────────────────────────
