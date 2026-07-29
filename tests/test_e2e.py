@@ -206,9 +206,17 @@ class TestHappyPath:
         paths, _ = server.recorder.snapshot()
         assert paths["/health"] > 0
         assert paths["/items"] > 0
-        # Locust counted what the server saw; a mismatch here means requests
-        # went somewhere the stats did not.
-        assert metrics["requests"] == paths["/health"] + paths["/items"]
+        # Locust counted what the server saw. The two numbers cannot be
+        # compared for equality: locust counts a request when the response
+        # comes back, the server counts it when it arrives, so a request that
+        # is still in flight when the run time expires is seen by the server
+        # and never reaches the stats. At most one such request per user can
+        # be open at any moment, which bounds the gap by the user count.
+        # What must hold is the direction: every request in the stats really
+        # went to the target, so the stats can never run ahead of the server.
+        sent = paths["/health"] + paths["/items"]
+        assert metrics["requests"] <= sent
+        assert sent - metrics["requests"] <= config["load"]["users"]
 
     def test_capture_chains_a_real_response_into_the_next_request(
         self, server, tmp_path
