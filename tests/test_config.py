@@ -132,6 +132,90 @@ class TestRuntimePlaceholderPreservation:
         monkeypatch.delenv("UNSET_VAR", raising=False)
         assert _resolve_env_value("${env:UNSET_VAR:-fallback}") == "fallback"
 
+    def test_env_namespace_deferred_when_asked(self, monkeypatch):
+        monkeypatch.setenv("MY_TOKEN", "xyz")
+        assert (
+            _resolve_env_value("${env:MY_TOKEN}", defer_env=True) == "${env:MY_TOKEN}"
+        )
+
+    def test_bare_name_still_resolved_when_env_deferred(self, monkeypatch):
+        monkeypatch.setenv("PLAIN", "resolved")
+        assert _resolve_env_value("${PLAIN}", defer_env=True) == "resolved"
+
+
+class TestEnvDeferredToRuntime:
+    """B: secrets must not be baked into the generated locustfile.
+
+    The generated file lands in the artifacts directory and is routinely
+    uploaded as a CI build artifact, so ${env:} inside `scenario` / `users`
+    stays a placeholder and is read from the environment by the locust
+    process instead.
+    """
+
+    def _write(self, tmp_path, config):
+        path = tmp_path / "loconfig.json"
+        path.write_text(json.dumps(config))
+        return load_config(path)
+
+    def test_scenario_secret_is_not_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("API_TOKEN", "s3cret")
+        result = self._write(tmp_path, {
+            "scenario": {
+                "auth": {"type": "bearer", "token": "${env:API_TOKEN}"},
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }
+        })
+        assert result["scenario"]["auth"]["token"] == "${env:API_TOKEN}"
+
+    def test_persona_secret_is_not_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("API_TOKEN", "s3cret")
+        result = self._write(tmp_path, {
+            "users": [{
+                "name": "reader",
+                "headers": {"Authorization": "Bearer ${env:API_TOKEN}"},
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }]
+        })
+        header = result["users"][0]["headers"]["Authorization"]
+        assert header == "Bearer ${env:API_TOKEN}"
+
+    def test_host_is_still_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TARGET", "https://staging.example.com")
+        result = self._write(tmp_path, {
+            "load": {"host": "${env:TARGET}"},
+            "scenario": {"requests": [{"name": "P", "method": "GET", "path": "/p"}]},
+        })
+        # locust gets this on the command line; nothing resolves it later.
+        assert result["load"]["host"] == "https://staging.example.com"
+
+    def test_pool_source_is_still_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ACCOUNTS", "accounts.csv")
+        result = self._write(tmp_path, {
+            "scenario": {
+                "data": {"accounts": {"source": "${env:ACCOUNTS}"}},
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }
+        })
+        # A path the generator opens itself, so it must be resolved and then
+        # made absolute relative to the config file.
+        assert result["scenario"]["data"]["accounts"]["source"].endswith("accounts.csv")
+        assert "${env:" not in result["scenario"]["data"]["accounts"]["source"]
+
+    def test_secret_never_reaches_the_generated_file(self, tmp_path, monkeypatch):
+        from locomotive.scenario import generate_locustfile
+
+        monkeypatch.setenv("API_TOKEN", "s3cret")
+        config = self._write(tmp_path, {
+            "scenario": {
+                "auth": {"type": "bearer", "token": "${env:API_TOKEN}"},
+                "requests": [{"name": "P", "method": "GET", "path": "/p"}],
+            }
+        })
+        path = generate_locustfile(config["scenario"], {}, tmp_path)
+        content = path.read_text()
+        assert "s3cret" not in content
+        assert "${env:API_TOKEN}" in content
+
 
 class TestCollectCaptureNames:
     def test_collects_from_on_start(self):
@@ -259,6 +343,94 @@ class TestDataSourcePathResolution:
         assert result["scenario"]["data"]["accounts"]["inline"] == [{"login": "u1"}]
 
 
+class TestPersonaPathResolution:
+    """Pools declared inside a persona are resolved like any other pool."""
+
+    def _load(self, tmp_path, config):
+        config_path = tmp_path / "loconfig.json"
+        config_path.write_text(json.dumps(config))
+        return load_config(config_path)
+
+    def test_nested_persona_source_resolved(self, tmp_path):
+        result = self._load(tmp_path, {"users": [{
+            "weight": 1,
+            "scenario": {
+                "data": {"acc": {"source": "data/accounts.csv"}},
+                "requests": [{"method": "GET", "path": "/p"}],
+            },
+        }]})
+        source = result["users"][0]["scenario"]["data"]["acc"]["source"]
+        assert str(tmp_path) in source and source.endswith("accounts.csv")
+
+    def test_flat_persona_source_resolved(self, tmp_path):
+        result = self._load(tmp_path, {"users": [{
+            "weight": 1,
+            "data": {"acc": {"source": "data/accounts.csv"}},
+            "requests": [{"method": "GET", "path": "/p"}],
+        }]})
+        source = result["users"][0]["data"]["acc"]["source"]
+        assert str(tmp_path) in source and source.endswith("accounts.csv")
+
+    def test_included_persona_resolves_against_its_own_file(self, tmp_path):
+        (tmp_path / "personas").mkdir()
+        (tmp_path / "personas" / "buyer.json").write_text(json.dumps({
+            "data": {"acc": {"source": "accounts.csv"}},
+            "requests": [{"method": "GET", "path": "/p"}],
+        }))
+        result = self._load(tmp_path, {
+            "users": [{"weight": 1, "include": "personas/buyer.json"}]
+        })
+        source = result["users"][0]["data"]["acc"]["source"]
+        # 'accounts.csv' sits next to buyer.json, not next to loconfig.json.
+        assert source == str(tmp_path / "personas" / "accounts.csv")
+
+    def test_included_scenario_resolves_against_its_own_file(self, tmp_path):
+        (tmp_path / "parts").mkdir()
+        (tmp_path / "parts" / "main.json").write_text(json.dumps({
+            "data": {"acc": {"source": "accounts.csv"}},
+            "requests": [{"method": "GET", "path": "/p"}],
+        }))
+        result = self._load(tmp_path, {"scenario": {"include": "parts/main.json"}})
+        assert result["scenario"]["data"]["acc"]["source"] == str(
+            tmp_path / "parts" / "accounts.csv"
+        )
+
+    def test_absolute_source_in_include_untouched(self, tmp_path):
+        (tmp_path / "parts").mkdir()
+        (tmp_path / "parts" / "main.json").write_text(json.dumps({
+            "data": {"acc": {"source": "/abs/accounts.csv"}},
+            "requests": [{"method": "GET", "path": "/p"}],
+        }))
+        result = self._load(tmp_path, {"scenario": {"include": "parts/main.json"}})
+        assert result["scenario"]["data"]["acc"]["source"] == "/abs/accounts.csv"
+
+
+class TestBareDollarFormIsGone:
+    """`$NAME` is data now, not a placeholder."""
+
+    def _load(self, tmp_path, config):
+        config_path = tmp_path / "loconfig.json"
+        config_path.write_text(json.dumps(config))
+        return load_config(config_path)
+
+    def test_bare_name_not_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCO_HOST", "http://from-env")
+        result = self._load(tmp_path, {"load": {"host": "$LOCO_HOST"}})
+        assert result["load"]["host"] == "$LOCO_HOST"
+
+    def test_braced_form_still_substituted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCO_HOST", "http://from-env")
+        result = self._load(tmp_path, {"load": {"host": "${LOCO_HOST}"}})
+        assert result["load"]["host"] == "http://from-env"
+
+    def test_json_schema_ref_survives(self, tmp_path):
+        result = self._load(tmp_path, {"scenario": {"requests": [
+            {"method": "POST", "path": "/p", "json": {"$ref": "#/x", "q": "a$b"}}
+        ]}})
+        body = result["scenario"]["requests"][0]["json"]
+        assert body == {"$ref": "#/x", "q": "a$b"}
+
+
 # ── include directive ─────────────────────────────────────────────────
 
 
@@ -382,3 +554,87 @@ class TestFakePreservation:
         result = load_config(config_path)
         fields = result["scenario"]["data"]["people"]["generate"]["fields"]
         assert fields["email"] == "${fake:email}"
+
+
+class TestLoadConfigRaw:
+    """`loco diff` reads what was written, not what it resolves to."""
+
+    def _write(self, tmp_path, data):
+        import json
+        path = tmp_path / "loconfig.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_placeholders_survive(self, tmp_path, monkeypatch):
+        from locomotive.config import load_config_raw
+        monkeypatch.setenv("PATH_ID", "77")
+        path = self._write(tmp_path, {"scenario": {"requests": [
+            {"name": "R", "method": "GET", "path": "/users/${PATH_ID:-1}"}]}})
+        cfg = load_config_raw(path)
+        assert cfg["scenario"]["requests"][0]["path"] == "/users/${PATH_ID:-1}"
+
+    def test_load_config_still_substitutes(self, tmp_path, monkeypatch):
+        from locomotive.config import load_config
+        monkeypatch.setenv("PATH_ID", "77")
+        path = self._write(tmp_path, {"scenario": {"requests": [
+            {"name": "R", "method": "GET", "path": "/users/${PATH_ID:-1}"}]}})
+        cfg = load_config(path)
+        assert cfg["scenario"]["requests"][0]["path"] == "/users/77"
+
+    def test_includes_are_expanded(self, tmp_path):
+        import json
+        from locomotive.config import load_config_raw
+        (tmp_path / "part.json").write_text(
+            json.dumps({"requests": [{"name": "R", "method": "GET", "path": "/r"}]}),
+            encoding="utf-8")
+        path = self._write(tmp_path, {"scenario": {"include": "part.json"}})
+        cfg = load_config_raw(path)
+        assert cfg["scenario"]["requests"][0]["path"] == "/r"
+
+    def test_missing_file_raises(self, tmp_path):
+        from locomotive.config import load_config_raw
+        with pytest.raises(FileNotFoundError):
+            load_config_raw(tmp_path / "nope.json")
+
+
+class TestParseErrors:
+    def _load(self, tmp_path, name, text):
+        from locomotive.config import load_config
+
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return load_config(path)
+
+    def test_yaml_error_names_the_file(self, tmp_path):
+        pytest.importorskip("yaml")
+        with pytest.raises(ValueError) as excinfo:
+            self._load(tmp_path, "bad.yaml", "target:\n\thost: http://x\n")
+        message = str(excinfo.value)
+        # PyYAML names the stream it was given. Handed a bare string it says
+        # `in "<unicode string>"`, which sends the reader looking for a file
+        # that does not exist.
+        assert "<unicode string>" not in message
+        assert "bad.yaml" in message
+        assert "could not parse YAML" in message
+
+    def test_json_error_carries_line_and_column(self, tmp_path):
+        with pytest.raises(ValueError) as excinfo:
+            self._load(tmp_path, "bad.json", '{\n  "load": {},\n}\n')
+        message = str(excinfo.value)
+        assert "could not parse JSON" in message
+        assert "line 3" in message
+        assert "bad.json" in message
+
+    def test_top_level_list_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError) as excinfo:
+            self._load(tmp_path, "list.json", "[]")
+        assert "must be an object at the top level" in str(excinfo.value)
+        assert "got list" in str(excinfo.value)
+
+    def test_top_level_scalar_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError) as excinfo:
+            self._load(tmp_path, "scalar.json", '"hello"')
+        assert "got str" in str(excinfo.value)
+
+    def test_empty_file_is_an_empty_config(self, tmp_path):
+        assert self._load(tmp_path, "empty.yaml", "\n") == {}

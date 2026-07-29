@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _MAX_DEPTH = 6
 
@@ -72,6 +72,13 @@ _NAME_RULES = [
 
 _HTTP_METHODS = ("get", "post", "put", "patch", "delete")
 
+# Everything an OpenAPI path item may declare. Scaffolding sticks to
+# ``_HTTP_METHODS`` — nobody wants a generated load test that spends its
+# budget on OPTIONS — but ``loco diff`` has to *see* the rest, or a config
+# that deliberately calls ``HEAD /health`` reports as a removed endpoint on
+# every single run.
+_ALL_HTTP_METHODS = _HTTP_METHODS + ("head", "options", "trace")
+
 
 # ── spec loading ──────────────────────────────────────────────────────
 
@@ -90,7 +97,114 @@ def load_spec(path: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# ── server / base path ────────────────────────────────────────────────
+
+
+_ABS_URL_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://[^/]+)(/.*)?$")
+
+
+def _expand_server_url(server: Dict[str, Any]) -> str:
+    """Substitute ``{var}`` templates in a server URL with their defaults."""
+    url = server.get("url")
+    if not isinstance(url, str):
+        return ""
+    variables = server.get("variables")
+    if isinstance(variables, dict):
+        for name, declaration in variables.items():
+            if not isinstance(declaration, dict):
+                continue
+            value = declaration.get("default")
+            if value is None:
+                enum = declaration.get("enum")
+                value = enum[0] if isinstance(enum, list) and enum else None
+            if value is not None:
+                url = url.replace("{%s}" % name, str(value))
+    return url
+
+
+def _split_url(url: str) -> Tuple[str, str]:
+    """Split a URL into (scheme://host, path prefix). Either half may be ''."""
+    url = (url or "").strip()
+    if not url:
+        return "", ""
+    match = _ABS_URL_RE.match(url)
+    if match:
+        host, prefix = match.group(1), match.group(2) or ""
+    else:
+        host, prefix = "", url if url.startswith("/") else "/" + url
+    prefix = prefix.rstrip("/")
+    return host, prefix
+
+
+def base_url(spec: Dict[str, Any]) -> Tuple[str, str]:
+    """Return the (host, path prefix) the spec declares for its operations.
+
+    OpenAPI 3 puts this in ``servers[0].url``; Swagger 2 splits it across
+    ``schemes``/``host``/``basePath``. Either way it holds the part of the URL
+    that the ``paths`` keys leave out — usually a ``/v1`` or ``/api`` prefix.
+    Ignoring it produced a scaffold that 404s on every single request.
+
+    The two halves come back separately on purpose. The host is only a
+    *default* for ``load.host`` (``--host`` still wins), while the prefix is
+    written into every generated path — so pointing the finished config at a
+    staging server does not silently drop ``/v1`` along with the hostname.
+    """
+    servers = spec.get("servers")
+    url = ""
+    if isinstance(servers, list):
+        for server in servers:
+            if isinstance(server, dict):
+                url = _expand_server_url(server)
+                if url:
+                    break
+    if url:
+        return _split_url(url)
+
+    # Swagger 2.0
+    host = spec.get("host")
+    legacy = ""
+    if isinstance(host, str) and host.strip():
+        schemes = spec.get("schemes")
+        scheme = "https"
+        if isinstance(schemes, list) and schemes and isinstance(schemes[0], str):
+            scheme = schemes[0]
+        legacy = f"{scheme}://{host.strip()}"
+    base_path = spec.get("basePath")
+    if isinstance(base_path, str) and base_path.strip():
+        legacy += base_path.strip()
+    return _split_url(legacy)
+
+
+def _full_path(path: str, spec: Dict[str, Any]) -> str:
+    """The request path as it must be written in the config: prefix + path."""
+    return base_url(spec)[1] + convert_path_params(path)
+
+
 # ── $ref / allOf resolution ───────────────────────────────────────────
+
+
+def _schema_type(schema: Dict[str, Any]) -> Optional[str]:
+    """The schema's type as a single name, ignoring ``null``.
+
+    OpenAPI 3.1 lets ``type`` be a list — ``{"type": ["integer", "null"]}`` is
+    how a nullable integer is written there — and every ``type == "integer"``
+    check would miss it, scaffolding the field as ``${fake:word}``.
+    """
+    typ = schema.get("type")
+    if isinstance(typ, list):
+        for entry in typ:
+            if isinstance(entry, str) and entry != "null":
+                return entry
+        return None
+    return typ if isinstance(typ, str) else None
+
+
+def _is_null_schema(schema: Any) -> bool:
+    """True for the 3.1 ``{"type": "null"}`` half of a nullable union."""
+    if not isinstance(schema, dict):
+        return False
+    typ = schema.get("type")
+    return typ == "null" or typ == ["null"]
 
 
 def _deref(ref: str, spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,15 +241,28 @@ def resolve(schema: Any, spec: Dict[str, Any], depth: int = 0) -> Dict[str, Any]
         for key, value in schema.items():
             if key != "allOf":
                 merged.setdefault(key, value)
-        merged["type"] = "object"
         if props:
+            # Properties anywhere in the composition make this an object no
+            # matter what the branches called themselves.
+            merged["type"] = "object"
             merged["properties"] = props
+        elif "type" not in merged:
+            merged["type"] = "object"
         if required:
             merged["required"] = sorted(set(required))
         return merged
     for combiner in ("oneOf", "anyOf"):
         variants = schema.get(combiner)
         if isinstance(variants, list) and variants:
+            # `{"oneOf": [{"type": "null"}, {"$ref": ...}]}` is how a nullable
+            # value is often written; taking variants[0] blindly scaffolded the
+            # null half and lost the actual shape.
+            for variant in variants:
+                if _is_null_schema(variant):
+                    continue
+                resolved = resolve(variant, spec, depth + 1)
+                if resolved and not _is_null_schema(resolved):
+                    return resolved
             return resolve(variants[0], spec, depth + 1)
     return schema
 
@@ -156,7 +283,7 @@ def _int_range(schema: Dict[str, Any]) -> str:
 def _scalar_placeholder(name: str, schema: Dict[str, Any]) -> Any:
     """Pick a placeholder for a scalar field from its name/format/type."""
     fmt = schema.get("format")
-    typ = schema.get("type")
+    typ = _schema_type(schema)
     lname = (name or "").lower()
 
     if fmt in _FORMAT_MAP:
@@ -211,7 +338,7 @@ def synthesize(
     if isinstance(enum, list) and enum:
         return "${choice:" + ",".join(str(v) for v in enum) + "}"
 
-    typ = schema.get("type")
+    typ = _schema_type(schema)
     if typ == "object" or "properties" in schema:
         props = schema.get("properties") or {}
         required = set(schema.get("required") or [])
@@ -268,20 +395,56 @@ def _collect_params(
     return out
 
 
-def _request_body_schema(operation: Dict[str, Any], spec: Dict[str, Any]) -> Optional[Any]:
+def _request_body(operation: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[Optional[Any], str]:
+    """Return (schema, kind) for the operation's request body.
+
+    ``kind`` is ``"json"`` or ``"form"``. Form bodies used to be skipped
+    entirely — the content loop only looked for ``json`` in the media type — so
+    an OAuth2 ``/token`` endpoint, which the OAuth spec *requires* to be
+    form-encoded, scaffolded with no body at all and returned 400 on every
+    call.
+    """
     request_body = operation.get("requestBody")
     if isinstance(request_body, dict):
         if "$ref" in request_body:
             request_body = _deref(request_body["$ref"], spec)
         content = request_body.get("content") or {}
-        for content_type, media in content.items():
-            if "json" in content_type.lower() and isinstance(media, dict):
-                return media.get("schema")
-    # Swagger 2.0: a parameter with in: body
+        if isinstance(content, dict):
+            for content_type, media in content.items():
+                if "json" in str(content_type).lower() and isinstance(media, dict):
+                    return media.get("schema"), "json"
+            for content_type, media in content.items():
+                lowered = str(content_type).lower()
+                if isinstance(media, dict) and (
+                    "form-urlencoded" in lowered or "multipart/form-data" in lowered
+                ):
+                    return media.get("schema"), "form"
+    # Swagger 2.0: a parameter with in: body, or formData parameters
     for param in operation.get("parameters") or []:
         if isinstance(param, dict) and param.get("in") == "body":
-            return param.get("schema")
-    return None
+            return param.get("schema"), "json"
+    form_props = {
+        param["name"]: param.get("schema") or param
+        for param in operation.get("parameters") or []
+        if isinstance(param, dict) and param.get("in") == "formData" and param.get("name")
+    }
+    if form_props:
+        required = [
+            param["name"]
+            for param in operation.get("parameters") or []
+            if isinstance(param, dict) and param.get("in") == "formData"
+            and param.get("required") and param.get("name")
+        ]
+        schema: Dict[str, Any] = {"type": "object", "properties": form_props}
+        if required:
+            schema["required"] = required
+        return schema, "form"
+    return None, "json"
+
+
+def _request_body_schema(operation: Dict[str, Any], spec: Dict[str, Any]) -> Optional[Any]:
+    """The body schema regardless of how it is encoded."""
+    return _request_body(operation, spec)[0]
 
 
 def _build_request(
@@ -298,7 +461,7 @@ def _build_request(
     req: Dict[str, Any] = {
         "name": summary or operation_id or f"{method.upper()} {path}",
         "method": method.upper(),
-        "path": convert_path_params(path),
+        "path": _full_path(path, spec),
         "weight": 1,
     }
     if operation_id:
@@ -324,13 +487,19 @@ def _build_request(
     if query:
         req["query"] = query
 
-    body_schema = _request_body_schema(operation, spec)
+    body_schema, body_kind = _request_body(operation, spec)
     if body_schema is not None:
         body = synthesize(body_schema, spec, required_only=required_only)
+        key = "data" if body_kind == "form" else "json"
         if isinstance(body, dict) and not body:
-            req["json"] = {"_comment": "TODO: request body schema had no properties"}
+            req[key] = {"_comment": "TODO: request body schema had no properties"}
         else:
-            req["json"] = body
+            req[key] = body
+        if body_kind == "form":
+            # The scenario-wide Content-Type is application/json; a form body
+            # sent under that header is rejected before it is even parsed.
+            headers = req.setdefault("headers", {})
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
 
     if operation.get("security"):
         req["_requires_auth"] = True
@@ -362,17 +531,31 @@ def extract_requests(spec: Dict[str, Any], required_only: bool = False) -> List[
 
 # ── auth detection (securitySchemes) ──────────────────────────────────
 
-# Path substrings that hint an operation is a login/token endpoint, with a
-# score so a clearer match (``/login``) beats a vaguer one (``/session``).
-_LOGIN_HINTS = [
-    (3, "login"),
-    (3, "signin"),
-    (3, "sign-in"),
-    (2, "authenticate"),
-    (2, "/token"),
-    (2, "/auth"),
-    (1, "session"),
-]
+# Words that hint an operation is a login/token endpoint, with a score so a
+# clearer match (``login``) beats a vaguer one (``session``). Matched against
+# whole path *words*, never as substrings: ``/authors`` used to score as an
+# ``/auth`` endpoint and a blog API scaffolded "log in by POSTing an article".
+_LOGIN_HINTS = {
+    "login": 3,
+    "logins": 3,
+    "signin": 3,
+    "authenticate": 2,
+    "authenticated": 2,
+    "token": 2,
+    "tokens": 2,
+    "oauth": 2,
+    "oauth2": 2,
+    "auth": 2,
+    "session": 1,
+    "sessions": 1,
+}
+
+# Words that rule an operation out even when a login word sits beside them:
+# ``/auth/logout`` and ``/auth/register`` are not how you log in.
+_NOT_LOGIN = {
+    "logout", "logouts", "signout", "revoke", "revocation",
+    "register", "registration", "signup", "reset", "forgot",
+}
 
 # Response fields that look like an auth token, most specific first.
 _TOKEN_KEYS = [
@@ -418,6 +601,43 @@ def _primary_security_scheme(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _path_words(path: str) -> List[str]:
+    """Every whole word in a path: segments, and their hyphen/underscore parts.
+
+    ``/api/v2/user-login/{id}`` -> ``api, v2, user-login, user, login``. The
+    templated segments are dropped, so a parameter called ``{token}`` does not
+    turn a resource path into a login endpoint.
+    """
+    words: List[str] = []
+    for segment in str(path).split("/"):
+        segment = segment.strip().lower()
+        if not segment or "{" in segment:
+            continue
+        words.append(segment)
+        parts = [p for p in re.split(r"[-_.]+", segment) if p]
+        if len(parts) > 1:
+            words.extend(parts)
+    return words
+
+
+def _login_score(path: str, operation: Dict[str, Any], spec: Dict[str, Any]) -> int:
+    """How much this POST operation looks like the way you log in."""
+    words = _path_words(path)
+    if any(word in _NOT_LOGIN for word in words):
+        return 0
+    score = max((_LOGIN_HINTS.get(word, 0) for word in words), default=0)
+    if not score:
+        return 0
+    # A credentials-shaped body settles the ties: of two endpoints under
+    # ``/auth``, the one that takes a password is the login and the one that
+    # takes a refresh token is not.
+    schema = resolve(_request_body_schema(operation, spec) or {}, spec)
+    props = schema.get("properties") or {}
+    if any("pass" in str(key).lower() for key in props):
+        score += 2
+    return score
+
+
 def _find_login(spec: Dict[str, Any]) -> Optional[tuple]:
     """Find the best POST operation that looks like a login/token endpoint."""
     best_score = 0
@@ -428,8 +648,7 @@ def _find_login(spec: Dict[str, Any]) -> Optional[tuple]:
         operation = item.get("post")
         if not isinstance(operation, dict):
             continue
-        lpath = path.lower()
-        score = max((s for s, hint in _LOGIN_HINTS if hint in lpath), default=0)
+        score = _login_score(path, operation, spec)
         if score > best_score:
             best_score, best = score, (path, operation)
     return best
@@ -491,17 +710,25 @@ def _login_body(schema: Optional[Any], spec: Dict[str, Any]) -> Dict[str, Any]:
 def _build_login_step(path: str, operation: Dict[str, Any], spec: Dict[str, Any]) -> tuple:
     """Build an on_start login request that captures the token. Returns (step, var)."""
     var = "token"
-    token_path = _find_token_path(_success_response_schema(operation, spec), spec) or "token"
+    # Whether the path was *found* is a different question from what it is:
+    # a response schema that really does have a ``token`` field used to get
+    # the "could not infer" TODO anyway, telling the user to fix a scaffold
+    # that was already correct.
+    inferred = _find_token_path(_success_response_schema(operation, spec), spec)
+    token_path = inferred or "token"
+    body_schema, body_kind = _request_body(operation, spec)
     step: Dict[str, Any] = {
         "name": operation.get("summary") or "Login",
         "method": "POST",
-        "path": convert_path_params(path),
-        "json": _login_body(_request_body_schema(operation, spec), spec),
+        "path": _full_path(path, spec),
+        "data" if body_kind == "form" else "json": _login_body(body_schema, spec),
         "capture": {var: token_path},
     }
+    if body_kind == "form":
+        step["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
     if operation.get("operationId"):
         step["_operation"] = operation["operationId"]
-    if token_path == "token":
+    if inferred is None:
         step["_comment_capture"] = (
             "Could not infer the token field from the login response schema; "
             "adjust 'capture' to the real path (e.g. data.access_token)"
@@ -555,9 +782,9 @@ def _first_param(path: str):
     return None
 
 
-def _op_key(path: str, method: str, operation: Dict[str, Any]) -> tuple:
+def _op_key(path: str, method: str, operation: Dict[str, Any], spec: Dict[str, Any]) -> tuple:
     op_id = operation.get("operationId")
-    return ("op", op_id) if op_id else ("mp", method.upper(), convert_path_params(path))
+    return ("op", op_id) if op_id else ("mp", method.upper(), _full_path(path, spec))
 
 
 def _response_id_field(operation: Dict[str, Any], spec: Dict[str, Any]) -> str:
@@ -635,7 +862,7 @@ def _infer_flows(spec: Dict[str, Any], required_only: bool = False) -> tuple:
         create_step = _build_request(c_path, c_method, c_op, c_common, spec, required_only)
         create_step["capture"] = {param: _response_id_field(c_op, spec)}
         steps = [create_step]
-        consumed.add(_op_key(c_path, c_method, c_op))
+        consumed.add(_op_key(c_path, c_method, c_op, spec))
 
         for i_path, i_method, i_op, i_common in sorted(
             g["items"], key=lambda t: (_STEP_ORDER.get(t[1].upper(), 9), t[0])
@@ -645,7 +872,7 @@ def _infer_flows(spec: Dict[str, Any], required_only: bool = False) -> tuple:
             if "${PATH_" not in step["path"]:
                 step.pop("_comment_path", None)
             steps.append(step)
-            consumed.add(_op_key(i_path, i_method, i_op))
+            consumed.add(_op_key(i_path, i_method, i_op, spec))
 
         flows.append({
             "name": _resource_name(base),
@@ -702,13 +929,18 @@ def spec_operations(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Each entry: operation_id, method, path, canonical (path with params ->
     '*'), body_fields, required_body, required_query.
+
+    ``path`` and ``canonical`` carry the server prefix, the same way the
+    generated config writes them. ``canonical_bare`` is the prefix-free form,
+    so a config that keeps ``/v1`` in ``load.host`` instead still matches.
     """
     operations: List[Dict[str, Any]] = []
+    prefix = base_url(spec)[1]
     for path, item in (spec.get("paths") or {}).items():
         if not isinstance(item, dict):
             continue
         common = item.get("parameters") or []
-        for method in _HTTP_METHODS:
+        for method in _ALL_HTTP_METHODS:
             operation = item.get(method)
             if not isinstance(operation, dict):
                 continue
@@ -723,8 +955,9 @@ def spec_operations(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
             operations.append({
                 "operation_id": operation.get("operationId") or "",
                 "method": method.upper(),
-                "path": path,
-                "canonical": _canonical_path(path),
+                "path": prefix + path,
+                "canonical": _canonical_path(prefix + path),
+                "canonical_bare": _canonical_path(path),
                 "body_fields": set(props.keys()),
                 "required_body": set(body_schema.get("required") or []),
                 "required_query": required_query,

@@ -325,6 +325,19 @@ class TestTokenPathInference:
         assert login["capture"]["token"] == "token"
         assert "_comment_capture" in login
 
+    def test_a_real_token_field_gets_no_todo(self):
+        # "token" as an *inferred* path is not the same as "token" as the
+        # fallback; the TODO used to fire on a scaffold that was correct.
+        spec = _spec(
+            schemes={"b": {"type": "http", "scheme": "bearer"}},
+            paths={"/login": {"post": {"operationId": "login",
+                "responses": {"200": {"content": {"application/json": {"schema": {"type": "object",
+                    "properties": {"token": {"type": "string"}}}}}}}}}},
+        )
+        _, login = detect_auth(spec)
+        assert login["capture"]["token"] == "token"
+        assert "_comment_capture" not in login
+
 
 class TestScaffoldScenario:
     def test_login_removed_from_requests(self):
@@ -446,3 +459,262 @@ class TestFlowInference:
                 "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}]}},
         }}
         assert self._flows(spec)[0]["name"] == "Order"
+
+
+# ── server url / base path ────────────────────────────────────────────
+
+from locomotive.openapi import base_url, spec_operations
+
+
+class TestBaseUrl:
+    def test_no_servers(self):
+        assert base_url({"openapi": "3.0.0", "paths": {}}) == ("", "")
+
+    def test_absolute_server_splits_host_and_prefix(self):
+        assert base_url({"servers": [{"url": "https://api.example.com/v1"}]}) == (
+            "https://api.example.com", "/v1")
+
+    def test_host_only_server_has_no_prefix(self):
+        assert base_url({"servers": [{"url": "https://api.example.com"}]}) == (
+            "https://api.example.com", "")
+
+    def test_trailing_slash_is_not_a_prefix(self):
+        assert base_url({"servers": [{"url": "https://api.example.com/"}]}) == (
+            "https://api.example.com", "")
+
+    def test_relative_server_is_prefix_only(self):
+        assert base_url({"servers": [{"url": "/api/v2"}]}) == ("", "/api/v2")
+
+    def test_server_variables_use_defaults(self):
+        spec = {"servers": [{
+            "url": "https://{region}.example.com/{version}",
+            "variables": {"region": {"default": "eu"}, "version": {"default": "v3"}},
+        }]}
+        assert base_url(spec) == ("https://eu.example.com", "/v3")
+
+    def test_server_variable_falls_back_to_first_enum(self):
+        spec = {"servers": [{"url": "https://example.com/{stage}",
+                             "variables": {"stage": {"enum": ["beta", "prod"]}}}]}
+        assert base_url(spec) == ("https://example.com", "/beta")
+
+    def test_first_usable_server_wins(self):
+        spec = {"servers": [{"description": "no url"}, {"url": "https://b.example.com/v9"}]}
+        assert base_url(spec) == ("https://b.example.com", "/v9")
+
+    def test_swagger2_host_and_basepath(self):
+        spec = {"swagger": "2.0", "host": "api.example.com",
+                "basePath": "/v1", "schemes": ["http"]}
+        assert base_url(spec) == ("http://api.example.com", "/v1")
+
+    def test_swagger2_defaults_to_https(self):
+        spec = {"swagger": "2.0", "host": "api.example.com", "basePath": "/v1"}
+        assert base_url(spec) == ("https://api.example.com", "/v1")
+
+    def test_swagger2_basepath_without_host(self):
+        assert base_url({"swagger": "2.0", "basePath": "/v1"}) == ("", "/v1")
+
+    def test_openapi3_servers_win_over_legacy_keys(self):
+        spec = {"servers": [{"url": "https://new.example.com/v2"}],
+                "host": "old.example.com", "basePath": "/v1"}
+        assert base_url(spec) == ("https://new.example.com", "/v2")
+
+
+class TestPrefixReachesGeneratedPaths:
+    _SPEC = {
+        "servers": [{"url": "https://api.example.com/v1"}],
+        "paths": {"/users": {"get": {"operationId": "listUsers"}},
+                  "/users/{id}": {"get": {"operationId": "getUser"}}},
+    }
+
+    def test_requests_carry_the_prefix(self):
+        paths = {r["path"] for r in extract_requests(self._SPEC)}
+        assert paths == {"/v1/users", "/v1/users/${PATH_ID:-1}"}
+
+    def test_no_prefix_leaves_paths_alone(self):
+        spec = {"servers": [{"url": "https://api.example.com"}],
+                "paths": {"/users": {"get": {}}}}
+        assert extract_requests(spec)[0]["path"] == "/users"
+
+    def test_flow_steps_carry_the_prefix(self):
+        spec = {"servers": [{"url": "/api"}], "paths": {
+            "/orders": {"post": {"operationId": "c", "responses": {"201": {
+                "content": {"application/json": {"schema": {"type": "object",
+                    "properties": {"id": {"type": "string"}}}}}}}}},
+            "/orders/{id}": {"get": {"operationId": "g"}},
+        }}
+        steps = scaffold_scenario(spec)["flows"][0]["steps"]
+        assert steps[0]["path"] == "/api/orders"
+        assert steps[1]["path"] == "/api/orders/${var:id}"
+
+    def test_login_step_carries_the_prefix(self):
+        spec = {
+            "servers": [{"url": "https://api.example.com/v1"}],
+            "components": {"securitySchemes": {"b": {"type": "http", "scheme": "bearer"}}},
+            "paths": {"/auth/login": {"post": {"operationId": "login"}}},
+        }
+        _, login = detect_auth(spec)
+        assert login["path"] == "/v1/auth/login"
+
+    def test_folded_operations_are_still_recognised_without_operation_ids(self):
+        # No operationId anywhere, so consumption is matched by method+path;
+        # the prefix has to be on both sides of that comparison.
+        spec = {"servers": [{"url": "/api"}], "paths": {
+            "/orders": {"post": {"responses": {"201": {"content": {"application/json": {
+                "schema": {"type": "object", "properties": {"id": {"type": "string"}}}}}}}}},
+            "/orders/{id}": {"delete": {}},
+        }}
+        result = scaffold_scenario(spec)
+        assert result["flows"]
+        assert result["requests"] == []
+
+    def test_spec_operations_report_both_forms(self):
+        ops = {o["operation_id"]: o for o in spec_operations(self._SPEC)}
+        assert ops["listUsers"]["path"] == "/v1/users"
+        assert ops["listUsers"]["canonical"] == "/v1/users"
+        assert ops["listUsers"]["canonical_bare"] == "/users"
+        assert ops["getUser"]["canonical"] == "/v1/users/*"
+
+
+# ── login heuristic ───────────────────────────────────────────────────
+
+
+def _bearer_spec(paths):
+    return {"components": {"securitySchemes": {"b": {"type": "http", "scheme": "bearer"}}},
+            "paths": paths}
+
+
+class TestLoginHeuristic:
+    def _login_path(self, paths):
+        _, login = detect_auth(_bearer_spec(paths))
+        return login["path"] if login else None
+
+    def test_authors_is_not_a_login_endpoint(self):
+        # '/auth' used to match as a substring, so a blog API "logged in"
+        # by POSTing an article.
+        assert self._login_path({"/authors": {"post": {}}}) is None
+
+    def test_authentication_word_still_matches(self):
+        assert self._login_path({"/authenticate": {"post": {}}}) == "/authenticate"
+
+    def test_auth_segment_matches(self):
+        assert self._login_path({"/api/auth": {"post": {}}}) == "/api/auth"
+
+    def test_hyphenated_word_matches(self):
+        assert self._login_path({"/user-login": {"post": {}}}) == "/user-login"
+
+    def test_logout_is_excluded(self):
+        assert self._login_path({"/auth/logout": {"post": {}}}) is None
+
+    def test_register_is_excluded(self):
+        assert self._login_path({"/auth/register": {"post": {}}}) is None
+
+    def test_login_beats_logout_in_the_same_spec(self):
+        assert self._login_path({
+            "/auth/logout": {"post": {}},
+            "/auth/login": {"post": {}},
+        }) == "/auth/login"
+
+    def test_a_password_body_breaks_the_tie(self):
+        creds = {"requestBody": {"content": {"application/json": {"schema": {
+            "type": "object", "properties": {"user": {"type": "string"},
+                                             "password": {"type": "string"}}}}}}}
+        refresh = {"requestBody": {"content": {"application/json": {"schema": {
+            "type": "object", "properties": {"refresh": {"type": "string"}}}}}}}
+        assert self._login_path({"/auth/refresh": {"post": refresh},
+                                 "/auth/session": {"post": creds}}) == "/auth/session"
+
+    def test_token_param_does_not_make_a_login(self):
+        assert self._login_path({"/documents/{token}": {"post": {}}}) is None
+
+    def test_no_hint_at_all(self):
+        assert self._login_path({"/orders": {"post": {}}}) is None
+
+
+# ── form-encoded bodies ───────────────────────────────────────────────
+
+
+class TestFormBodies:
+    def _request(self, operation):
+        return extract_requests({"paths": {"/x": {"post": operation}}})[0]
+
+    def test_form_body_becomes_data(self):
+        req = self._request({"requestBody": {"content": {
+            "application/x-www-form-urlencoded": {"schema": {"type": "object", "properties": {
+                "grant_type": {"type": "string", "default": "password"}}}}}}})
+        assert req["data"] == {"grant_type": "password"}
+        assert "json" not in req
+        assert req["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+    def test_json_wins_when_both_are_offered(self):
+        req = self._request({"requestBody": {"content": {
+            "application/x-www-form-urlencoded": {"schema": {"type": "object",
+                "properties": {"a": {"type": "string", "default": "form"}}}},
+            "application/json": {"schema": {"type": "object",
+                "properties": {"a": {"type": "string", "default": "json"}}}},
+        }}})
+        assert req["json"] == {"a": "json"}
+        assert "data" not in req and "headers" not in req
+
+    def test_multipart_is_form_too(self):
+        req = self._request({"requestBody": {"content": {"multipart/form-data": {
+            "schema": {"type": "object", "properties": {"a": {"type": "string", "default": "x"}}}}}}})
+        assert req["data"] == {"a": "x"}
+
+    def test_swagger2_formdata_params(self):
+        req = self._request({"parameters": [
+            {"name": "grant_type", "in": "formData", "required": True,
+             "type": "string", "default": "password"},
+            {"name": "scope", "in": "formData", "type": "string", "default": "read"},
+        ]})
+        assert req["data"] == {"grant_type": "password", "scope": "read"}
+        assert req["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+    def test_form_login_step_uses_data(self):
+        body = {"requestBody": {"content": {"application/x-www-form-urlencoded": {
+            "schema": {"type": "object", "properties": {
+                "username": {"type": "string"}, "password": {"type": "string"}}}}}}}
+        spec = _bearer_spec({"/oauth/token": {"post": body}})
+        _, login = detect_auth(spec)
+        assert login["data"] == {"username": "${TEST_USER}", "password": "${TEST_PASSWORD}"}
+        assert "json" not in login
+        assert login["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+    def test_unknown_content_type_yields_no_body(self):
+        req = self._request({"requestBody": {"content": {"application/octet-stream": {
+            "schema": {"type": "string", "format": "binary"}}}}})
+        assert "json" not in req and "data" not in req
+
+
+# ── OpenAPI 3.1 type unions ───────────────────────────────────────────
+
+
+class TestNullableUnions:
+    def test_type_list_keeps_the_real_type(self):
+        # {"type": ["integer", "null"]} used to fall through to ${fake:word}.
+        assert synthesize({"type": ["integer", "null"], "minimum": 5, "maximum": 5}, {},
+                          "score") == "${randint:5:5}"
+
+    def test_type_list_object_still_recurses(self):
+        result = synthesize({"type": ["object", "null"], "properties": {
+            "email": {"type": "string"}}}, {})
+        assert result == {"email": "${fake:email}"}
+
+    def test_oneof_skips_the_null_variant(self):
+        schema = {"oneOf": [{"type": "null"}, {"type": "object",
+                                               "properties": {"a": {"type": "string"}}}]}
+        assert resolve(schema, {})["type"] == "object"
+
+    def test_anyof_skips_a_null_ref(self):
+        spec = {"components": {"schemas": {"Nothing": {"type": "null"},
+                                           "Thing": {"type": "object",
+                                                     "properties": {"a": {"type": "string"}}}}}}
+        schema = {"anyOf": [{"$ref": "#/components/schemas/Nothing"},
+                            {"$ref": "#/components/schemas/Thing"}]}
+        assert set(resolve(schema, spec)["properties"]) == {"a"}
+
+    def test_all_null_union_is_not_a_crash(self):
+        assert resolve({"oneOf": [{"type": "null"}]}, {})["type"] == "null"
+
+    def test_allof_of_scalars_keeps_its_type(self):
+        schema = {"allOf": [{"type": "string"}, {"minLength": 3}]}
+        assert resolve(schema, {})["type"] == "string"

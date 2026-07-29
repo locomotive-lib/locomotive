@@ -23,8 +23,10 @@ DATA_MODES = frozenset({"unique_per_user", "round_robin", "random", "once"})
 _POOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
-def _slugify(value: str) -> str:
-    value = value.strip().lower()
+def _slugify(value: Any) -> str:
+    # Names, tags and flow titles come straight from YAML/JSON and are not
+    # necessarily strings (`name: 2024` is an int).
+    value = str(value).strip().lower()
     value = _NAME_RE.sub("_", value)
     value = value.strip("_")
     return value or "task"
@@ -44,6 +46,73 @@ def _safe_float(value: Any, default: float) -> float:
         return default
 
 
+def _tag_set(value: Any) -> set:
+    """Normalise a `tags` value into a set of tag names.
+
+    ``tags: "purchase"`` is a natural thing to write, and ``set("purchase")``
+    is the set of its *letters* — which intersects nothing, so the request was
+    silently dropped from every tag-filtered run. A string is treated as one
+    tag, or as several when it is comma-separated (the same shape the CLI's
+    ``--tags`` flag accepts).
+    """
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {part.strip() for part in value.split(",") if part.strip()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        tags: set = set()
+        for item in value:
+            tags |= _tag_set(item)
+        return tags
+    return {str(value)}
+
+
+def _literal(value: Any) -> str:
+    """Render a config value as a Python literal for the generated file.
+
+    ``repr()`` alone is not safe here. A YAML config can hold values whose
+    repr is not valid inside a standalone module (``datetime.date(2024, 1, 1)``
+    needs an import that is not there) or not valid Python at all (``inf``,
+    ``nan`` — YAML's ``.inf`` and ``.nan`` — render as bare names and raise
+    NameError when locust imports the file). Everything that is not a JSON
+    scalar is rendered as the string an HTTP body would have carried anyway.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        # bool before int matters: repr(True) is 'True', not '1'.
+        return repr(value)
+    if isinstance(value, float):
+        if value != value:
+            return "float('nan')"
+        if value == float("inf"):
+            return "float('inf')"
+        if value == float("-inf"):
+            return "float('-inf')"
+        return repr(value)
+    if isinstance(value, bytes):
+        return repr(value)
+    if isinstance(value, dict):
+        # HTTP header/JSON keys are strings; a YAML key like `2024: x` would
+        # otherwise become an int key that json.dumps renders differently.
+        items = ", ".join(
+            f"{_literal(k if isinstance(k, str) else str(k))}: {_literal(v)}"
+            for k, v in value.items()
+        )
+        return "{" + items + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_literal(v) for v in value) + "]"
+    if isinstance(value, (set, frozenset)):
+        # Sorted so the generated file (and `loco diff`) stays deterministic.
+        return "[" + ", ".join(_literal(v) for v in sorted(value, key=str)) + "]"
+    # datetime.date / datetime.datetime / datetime.time / Decimal / UUID / ...
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return repr(isoformat())
+        except (TypeError, ValueError):
+            pass
+    return repr(str(value))
+
+
 # ── module-level emitters (shared by all personas) ────────────────────
 
 
@@ -53,6 +122,7 @@ def _emit_imports() -> List[str]:
         "import base64",
         "import csv",
         "import json",
+        "import logging",
         "import os",
         "import re",
         "import threading",
@@ -60,18 +130,133 @@ def _emit_imports() -> List[str]:
         "import random",
         "import uuid",
         "from locust import HttpUser, SequentialTaskSet, task, between, tag",
+        "from locust import events",
         "",
     ]
 
 
-def _emit_helpers() -> List[str]:
-    """Generate module-level helper functions for dynamic values."""
+def _emit_helpers(shard_data: bool = True) -> List[str]:
+    """Generate module-level helper functions for dynamic values.
+
+    ``shard_data=False`` keeps the shard machinery — it still tells the run
+    how many processes there are, and still seeds ``${iteration}`` so ids do
+    not collide — but stops it dividing the pools. That is the right answer
+    when every worker is meant to see the whole pool, e.g. a read-only pool
+    of search terms that is smaller than the worker count.
+    """
     return [
+        "",
+        "_LOG = logging.getLogger('locomotive')",
+        "",
+        "# ── this process's share of the load ──────────────────────────────",
+        "#",
+        "# Under `--processes N` (or a master with N workers) locust forks after",
+        "# this file is imported, so every worker starts with the same empty pool",
+        "# state and the same counters. Left alone, eight workers hand out",
+        "# rows[0], rows[1], ... in parallel: every account in the pool is used",
+        "# eight times over, and a login-per-user scenario has eight virtual users",
+        "# sharing one session. `_shard()` is how a worker learns which slice of",
+        "# each pool is its own.",
+        "_SHARD = {'id': 0, 'count': 1, 'resolved': False}",
+        "_SHARD_ENV = {}",
+        f"_SHARD_DATA = {bool(shard_data)!r}",
+        "",
+        "",
+        "@events.init.add_listener",
+        "def _remember_environment(environment, **_kwargs):",
+        "    _SHARD_ENV['environment'] = environment",
+        "",
+        "",
+        "def _shard():",
+        "    '''Which of how many load-generating processes this one is.",
+        "",
+        "    Resolved on first use rather than at import: the worker index",
+        "    arrives from the master on connect, and the worker count arrives",
+        "    with the spawn message. Both are in place before the first user",
+        "    starts, and neither exists at import time.",
+        "    '''",
+        "    if _SHARD['resolved']:",
+        "        return _SHARD",
+        "    environment = _SHARD_ENV.get('environment')",
+        "    runner = getattr(environment, 'runner', None)",
+        "    if runner is None:",
+        "        # No runner yet — answer 'one process' without caching it, so",
+        "        # the real answer is still picked up once there is one.",
+        "        return _SHARD",
+        "    index = getattr(runner, 'worker_index', 0)",
+        "    options = getattr(environment, 'parsed_options', None)",
+        "    count = getattr(options, 'expect_workers', 1)",
+        "    try:",
+        "        count = int(count)",
+        "    except (TypeError, ValueError):",
+        "        count = 1",
+        "    try:",
+        "        index = int(index)",
+        "    except (TypeError, ValueError):",
+        "        index = -1",
+        "    if index < 0:",
+        "        # Masters up to 2.10.2 never send an index. Sharding on a guess",
+        "        # would hand the same rows to several workers, which is the",
+        "        # failure this exists to prevent — so it declines to shard, and",
+        "        # says why.",
+        "        _LOG.warning(",
+        "            'locomotive: this locust master does not report worker '",
+        "            'indexes (needs locust >= 2.11); data pools will not be '",
+        "            'split between workers'",
+        "        )",
+        "        index, count = 0, 1",
+        "    count = max(1, count)",
+        "    _SHARD.update({'id': index % count, 'count': count, 'resolved': True})",
+        "    return _SHARD",
+        "",
+        "",
+        "def _shard_pool(name, rows, mode, generated):",
+        "    '''This worker's slice of a pool, or the whole pool.",
+        "",
+        "    A stride (rows[id::count]) rather than a contiguous block: the",
+        "    slices differ in length by at most one row whatever the pool size,",
+        "    they never overlap, and together they are exactly the pool — so the",
+        "    uniqueness `unique_per_user` promises holds across the whole cluster,",
+        "    for the same len(pool) users as in a single process.",
+        "    '''",
+        "    shard = _shard()",
+        "    if not _SHARD_DATA:",
+        "        # load.shard_data: false — every process sees the whole pool.",
+        "        # _shard() is still called first: it is what marks the shard",
+        "        # resolved, and the caller will not cache a pool until it is.",
+        "        return rows",
+        "    if shard['count'] < 2 or not rows:",
+        "        return rows",
+        "    if mode not in ('unique_per_user', 'round_robin'):",
+        "        # 'once' has to keep seeing rows[0] or it stops meaning one row;",
+        "        # 'random' is already correct, and splitting it would only",
+        "        # narrow the values each worker can draw from.",
+        "        return rows",
+        "    if generated:",
+        "        # Synthesised rows are drawn independently in every process, so",
+        "        # there is no shared sequence to divide — splitting them would",
+        "        # just throw away seven eighths of the pool.",
+        "        return rows",
+        "    sliced = rows[shard['id']::shard['count']]",
+        "    if not sliced:",
+        "        _LOG.warning(",
+        "            'locomotive: data pool %r has %d row(s) for %d workers; '",
+        "            'worker %d would get none, so it is using the whole pool — '",
+        "            'rows will repeat across workers',",
+        "            name, len(rows), shard['count'], shard['id'],",
+        "        )",
+        "        return rows",
+        "    return sliced",
+        "",
         "",
         "# Dynamic value generators",
         "_iteration_counter = 0",
+        "_iteration_seeded = False",
         "",
         "_PLACEHOLDER_RE = re.compile(r'\\$\\{([^}]+)\\}')",
+        "# A value that is *only* a placeholder can keep the placeholder's own",
+        "# type when it lands in a JSON body — see _RuntimeMixin._resolve_json.",
+        "_ONLY_PLACEHOLDER_RE = re.compile(r'^\\$\\{([^}]+)\\}$')",
         "",
         "",
         "def _timestamp():",
@@ -86,8 +271,19 @@ def _emit_helpers() -> List[str]:
         "",
         "",
         "def _iteration():",
-        "    '''Incrementing counter.'''",
-        "    global _iteration_counter",
+        "    '''Incrementing counter, unique across workers.",
+        "",
+        "    Each worker starts a billion apart, so N workers produce N",
+        "    non-overlapping runs of numbers instead of N interleaved copies of",
+        "    1, 2, 3 — which matters the moment ${iteration} ends up in an",
+        "    order number or an idempotency key.",
+        "    '''",
+        "    global _iteration_counter, _iteration_seeded",
+        "    if not _iteration_seeded:",
+        "        shard = _shard()",
+        "        if shard['count'] > 1:",
+        "            _iteration_counter = shard['id'] * 1000000000",
+        "        _iteration_seeded = shard['resolved']",
         "    _iteration_counter += 1",
         "    return _iteration_counter",
         "",
@@ -96,6 +292,36 @@ def _emit_helpers() -> List[str]:
         "    '''Build a base64-encoded Basic Authorization header value.'''",
         "    raw = f'{username}:{password}'.encode('utf-8')",
         "    return 'Basic ' + base64.b64encode(raw).decode('ascii')",
+        "",
+        "",
+        "_JSON_INDEX_RE = re.compile(r'\\[(-?\\d+)\\]')",
+        "",
+        "",
+        "def _json_path(node, path):",
+        "    '''Walk a dot path through a decoded JSON body.",
+        "",
+        "    Supports object keys and list indices, in either notation:",
+        "    'data.items.0.id' and 'data.items[0].id' are the same path.",
+        "    Returns (found, value) so a captured null is not confused with a",
+        "    path that does not exist.",
+        "    '''",
+        "    parts = [p for p in _JSON_INDEX_RE.sub(r'.\\1', str(path)).split('.') if p != '']",
+        "    for part in parts:",
+        "        if isinstance(node, dict):",
+        "            if part not in node:",
+        "                return False, None",
+        "            node = node[part]",
+        "        elif isinstance(node, (list, tuple)):",
+        "            try:",
+        "                idx = int(part)",
+        "            except ValueError:",
+        "                return False, None",
+        "            if idx >= len(node) or idx < -len(node):",
+        "                return False, None",
+        "            node = node[idx]",
+        "        else:",
+        "            return False, None",
+        "    return True, node",
         "",
         "",
         "def _parse_env_ref(ref):",
@@ -232,7 +458,7 @@ def _emit_data_layer(data_specs: Dict[str, Dict[str, Any]]) -> List[str]:
     return [
         "",
         "# Data pools (${data:pool.field})",
-        f"_DATA_SPECS = {repr(data_specs)}",
+        f"_DATA_SPECS = {_literal(data_specs)}",
         "_DATA_POOLS = {}",
         "_DATA_COUNTERS = {}",
         "_DATA_LOCK = threading.Lock()",
@@ -248,6 +474,7 @@ def _emit_data_layer(data_specs: Dict[str, Dict[str, Any]]) -> List[str]:
         "        spec = _DATA_SPECS.get(name) or {}",
         "        rows = []",
         "        generate = spec.get('generate')",
+        "        _generated = generate is not None",
         "        if generate is not None:",
         "            count = generate.get('count', 100)",
         "            try:",
@@ -271,7 +498,12 @@ def _emit_data_layer(data_specs: Dict[str, Dict[str, Any]]) -> List[str]:
         "                        rows = list(csv.DictReader(handle))",
         "            except (OSError, ValueError):",
         "                rows = []",
-        "        _DATA_POOLS[name] = rows",
+        "        rows = _shard_pool(name, rows, spec.get('mode', 'unique_per_user'), _generated)",
+        "        if _SHARD['resolved'] or _SHARD['count'] > 1:",
+        "            # Caching before the shard is known would pin the whole",
+        "            # pool for the run. Only locust can answer that question,",
+        "            # and by the time a user exists it already has.",
+        "            _DATA_POOLS[name] = rows",
         "        return rows",
         "",
         "",
@@ -342,24 +574,117 @@ def _emit_runtime_mixin() -> List[str]:
         "        return _PLACEHOLDER_RE.sub(replace, value)",
         "",
         "    def _resolve_dict(self, d):",
-        "        '''Recursively resolve dynamic values in dict/list.'''",
+        "        '''Recursively resolve placeholders in dict keys and values.",
+        "",
+        "        Keys are resolved too: a query dict like",
+        "        {'${env:PARAM_NAME}': 'x'} or a body keyed by ${var:field} used",
+        "        to be sent with the placeholder text as the literal key.",
+        "        '''",
         "        if isinstance(d, dict):",
-        "            return {k: self._resolve_dict(v) for k, v in d.items()}",
+        "            return {",
+        "                (self._resolve(k) if isinstance(k, str) else k):",
+        "                self._resolve_dict(v) for k, v in d.items()",
+        "            }",
         "        if isinstance(d, list):",
         "            return [self._resolve_dict(v) for v in d]",
         "        return self._resolve(d)",
         "",
+        "    def _resolve_json(self, value):",
+        "        '''Resolve placeholders in a JSON body, keeping non-string types.",
+        "",
+        "        A JSON body is the one place where the type on the wire matters.",
+        "        {'quantity': '${randint:1:10}'} used to send the string '7', and",
+        "        an API that declares quantity as an integer answers 422 to that —",
+        "        which looks like a broken service in the report, not a broken",
+        "        config. When a value is exactly one placeholder, with no text",
+        "        around it, the placeholder's own type survives; anything mixed",
+        "        with other text is a string, as it has to be.",
+        "",
+        "        Headers, query params and form bodies keep using _resolve_dict:",
+        "        those are strings on the wire whatever the config says.",
+        "        '''",
+        "        if isinstance(value, dict):",
+        "            return {",
+        "                (self._resolve(k) if isinstance(k, str) else k):",
+        "                self._resolve_json(v) for k, v in value.items()",
+        "            }",
+        "        if isinstance(value, list):",
+        "            return [self._resolve_json(v) for v in value]",
+        "        if isinstance(value, str):",
+        "            match = _ONLY_PLACEHOLDER_RE.match(value)",
+        "            if match is not None:",
+        "                typed, handled = self._resolve_typed(match.group(1))",
+        "                if handled:",
+        "                    return typed",
+        "        return self._resolve(value)",
+        "",
+        "    def _resolve_typed(self, key):",
+        "        '''Native value for a whole-string placeholder: (value, handled).",
+        "",
+        "        Only placeholders whose type is beyond doubt are converted.",
+        "        ${uuid}, ${random}, ${choice:...}, ${now:...}, ${env:} and every",
+        "        ${fake:} but bool stay strings — a code that happens to be all",
+        "        digits is still a code.",
+        "        '''",
+        "        if key.startswith('var:'):",
+        "            variables = getattr(self, '_vars', {})",
+        "            name = key[4:]",
+        "            if name in variables:",
+        "                found = variables[name]",
+        "                # A captured number stays a number: the response said 42,",
+        "                # so the follow-up request sends 42, not '42'. A failed",
+        "                # capture stores None; '' keeps parity with _resolve",
+        "                # rather than turning the field into a JSON null.",
+        "                return ('' if found is None else found), True",
+        "            return None, False",
+        "        if key.startswith('data:'):",
+        "            pool_name, _, field_path = key[5:].partition('.')",
+        "            found = self._data_raw(pool_name, field_path)",
+        "            return ('' if found is None else found), True",
+        "        if key == 'fake:bool':",
+        "            return random.choice((True, False)), True",
+        "        func_name, _, func_args = key.partition(':')",
+        "        if func_name in ('randint', 'iteration', 'timestamp'):",
+        "            text = _call_function(func_name, func_args)",
+        "            try:",
+        "                return int(text), True",
+        "            except (TypeError, ValueError):",
+        "                return text, True",
+        "        return None, False",
+        "",
+        "    def _begin_request(self):",
+        "        '''Open a new per-request data scope.",
+        "",
+        "        'random' and 'round_robin' pools pick their row once per request",
+        "        and reuse it for every ${data:} placeholder in that request, so a",
+        "        login body cannot mix the username of one row with the password",
+        "        of another. This clears the previous request's choice.",
+        "        '''",
+        "        self._request_rows = {}",
+        "",
         "    def _data_value(self, pool_name, field_path):",
-        "        '''Resolve ${data:pool.field} for this user.'''",
+        "        '''Resolve ${data:pool.field} for this user, as a string.'''",
+        "        value = self._data_raw(pool_name, field_path)",
+        "        return '' if value is None else str(value)",
+        "",
+        "    def _data_raw(self, pool_name, field_path):",
+        "        '''The pool value as it was loaded, before any stringification.'''",
         "        rows = _load_pool(pool_name)",
         "        if not rows:",
-        "            return ''",
+        "            return None",
         "        spec = _DATA_SPECS.get(pool_name) or {}",
         "        mode = spec.get('mode', 'unique_per_user')",
-        "        if mode == 'random':",
-        "            row = random.choice(rows)",
-        "        elif mode == 'round_robin':",
-        "            row = rows[_next_index(pool_name + ':access', len(rows))]",
+        "        if mode in ('random', 'round_robin'):",
+        "            request_rows = getattr(self, '_request_rows', None)",
+        "            if request_rows is None:",
+        "                request_rows = self._request_rows = {}",
+        "            row = request_rows.get(pool_name)",
+        "            if row is None:",
+        "                if mode == 'random':",
+        "                    row = random.choice(rows)",
+        "                else:",
+        "                    row = rows[_next_index(pool_name + ':access', len(rows))]",
+        "                request_rows[pool_name] = row",
         "        else:",
         "            data_rows = getattr(self, '_data_rows', None)",
         "            if data_rows is None:",
@@ -378,7 +703,32 @@ def _emit_runtime_mixin() -> List[str]:
         "            else:",
         "                value = None",
         "                break",
-        "        return '' if value is None else str(value)",
+        "        return value",
+        "",
+        "    def _capture(self, response, spec):",
+        "        '''Store {name: json.path} values from a response body.",
+        "",
+        "        Returns a list of failure messages. A capture that finds nothing",
+        "        is a failed request: the alternative is an empty ${var:} that",
+        "        turns the next step into a puzzling 404 several lines later.",
+        "        The body is decoded once, however many variables are captured.",
+        "        '''",
+        "        variables = getattr(self, '_vars', None)",
+        "        if variables is None:",
+        "            variables = self._vars = {}",
+        "        try:",
+        "            body = response.json()",
+        "        except Exception:",
+        "            for name in spec:",
+        "                variables[name] = None",
+        "            return ['capture: response body is not JSON']",
+        "        fails = []",
+        "        for name, path in spec.items():",
+        "            found, value = _json_path(body, path)",
+        "            variables[name] = value if found else None",
+        "            if not found:",
+        "                fails.append('capture %s: no value at %s' % (name, path))",
+        "        return fails",
         "",
         "    def _assert_response(self, response, expect):",
         "        '''Check a response against an \"expect\" block.",
@@ -389,10 +739,15 @@ def _emit_runtime_mixin() -> List[str]:
         "            contains: str or list of str   - substrings the body must contain",
         "            json:     {dot.path: expected} - JSON fields (loose str compare)",
         "            max_ms:   number               - max response time in milliseconds",
+        "",
+        "        When 'status' is omitted the response still has to be one Locust",
+        "        itself would consider successful: an 'expect' block never turns a",
+        "        transport error or a 4xx/5xx into a passing sample.",
         "        '''",
         "        fails = []",
         "        if not isinstance(expect, dict):",
-        "            return fails",
+        "            expect = {}",
+        "        code = getattr(response, 'status_code', 0) or 0",
         "        status = expect.get('status')",
         "        if status is not None:",
         "            allowed = status if isinstance(status, (list, tuple)) else [status]",
@@ -402,32 +757,45 @@ def _emit_runtime_mixin() -> List[str]:
         "                    codes.append(int(s))",
         "                except (TypeError, ValueError):",
         "                    pass",
-        "            if codes and response.status_code not in codes:",
-        "                fails.append('status %s not in %s' % (response.status_code, codes))",
+        "            if codes and code not in codes:",
+        "                fails.append('status %s not in %s' % (code, codes))",
+        "        elif code == 0:",
+        "            # No response at all: connection refused, DNS failure, timeout.",
+        "            fails.append('no response received (connection error or timeout)')",
+        "        elif code >= 400:",
+        "            # 'expect' runs under catch_response, which suppresses Locust's own",
+        "            # raise_for_status(). Without an explicit 'status' expectation we keep",
+        "            # Locust's default notion of failure rather than silently passing.",
+        "            fails.append('status %s' % (code,))",
         "        contains = expect.get('contains')",
         "        if contains is not None:",
         "            needles = contains if isinstance(contains, (list, tuple)) else [contains]",
-        "            text = response.text or ''",
+        "            try:",
+        "                text = response.text or ''",
+        "            except Exception:",
+        "                text = ''",
         "            for needle in needles:",
         "                if str(needle) not in text:",
         "                    fails.append('body is missing %r' % (str(needle),))",
         "        json_expect = expect.get('json')",
         "        if isinstance(json_expect, dict) and json_expect:",
+        "            decoded = True",
         "            try:",
         "                body = response.json()",
         "            except Exception:",
         "                body = None",
+        "                decoded = False",
         "                fails.append('response body is not valid JSON')",
-        "            if body is not None:",
+        "            if decoded:",
         "                for path, expected in json_expect.items():",
-        "                    actual = body",
-        "                    for part in str(path).split('.'):",
-        "                        if isinstance(actual, dict):",
-        "                            actual = actual.get(part)",
-        "                        else:",
-        "                            actual = None",
-        "                            break",
-        "                    if str(actual) != str(expected):",
+        "                    # _json_path reports absence separately, so",
+        "                    # `expect: {json: {x: null}}` no longer passes on a",
+        "                    # response that has no 'x' at all. Array indices",
+        "                    # work here exactly as they do in 'capture'.",
+        "                    found, actual = _json_path(body, path)",
+        "                    if not found:",
+        "                        fails.append('json %s: no value at that path' % (path,))",
+        "                    elif str(actual) != str(expected):",
         "                        fails.append('json %s: expected %r, got %r' % (path, str(expected), actual))",
         "        max_ms = expect.get('max_ms')",
         "        if max_ms is not None:",
@@ -530,19 +898,29 @@ class ScenarioGenerator:
         self.flows: List[Dict[str, Any]] = []
         self.data_specs: Dict[str, Dict[str, Any]] = {}
 
+    @property
+    def _needs_request_scope(self) -> bool:
+        """True when some pool re-picks a row and needs a per-request scope.
+
+        'unique_per_user' and 'once' pin one row for the lifetime of the user,
+        so they never need the scope reset; only 'random' and 'round_robin' do.
+        Scenarios without such a pool generate exactly the code they did before.
+        """
+        return any(
+            (spec or {}).get("mode") in ("random", "round_robin")
+            for spec in self.data_specs.values()
+        )
+
     def _filter_by_tags(self, items: List[Any]) -> List[Any]:
         """Filter requests/flows by target include/exclude tags."""
-        include_tags = self.target.get("tags") or []
-        exclude_tags = self.target.get("exclude_tags") or []
-        if not include_tags and not exclude_tags:
+        include_set = _tag_set(self.target.get("tags")) or None
+        exclude_set = _tag_set(self.target.get("exclude_tags"))
+        if include_set is None and not exclude_set:
             return items
-
-        include_set = set(include_tags) if include_tags else None
-        exclude_set = set(exclude_tags) if exclude_tags else set()
 
         filtered = []
         for item in items:
-            item_tags = set(item.get("tags", [])) if isinstance(item, dict) else set()
+            item_tags = _tag_set(item.get("tags")) if isinstance(item, dict) else set()
             if item_tags & exclude_set:
                 continue
             if include_set is not None and not (item_tags & include_set):
@@ -667,7 +1045,12 @@ class ScenarioGenerator:
 
     def generate(self, output_dir: Path) -> Path:
         """Generate a complete locustfile for this single scenario."""
-        return _write_locustfile([self], output_dir)
+        # Read from this generator's own target: used directly as a library
+        # entry point, this is the only place `shard_data` can come from —
+        # `generate_locustfile` passes it explicitly for the persona case,
+        # where several targets could disagree.
+        shard_data = (self.target or {}).get("shard_data", True)
+        return _write_locustfile([self], output_dir, shard_data=shard_data is not False)
 
     @staticmethod
     def _validate_requests(requests: List[Any], section: str) -> None:
@@ -725,13 +1108,23 @@ class ScenarioGenerator:
 
     @staticmethod
     def _think_time_expr(think_time: Any) -> Optional[str]:
-        """Build a between(...) expression from a think_time config value."""
+        """Build a between(...) expression from a think_time config value.
+
+        Bounds are ordered and non-negative before they reach locust:
+        ``between(2, 0.5)`` makes ``random.uniform`` return values outside the
+        range the config asked for, and a negative wait makes locust sleep for
+        a nonsensical duration. Swapping is friendlier than failing — the
+        intent of ``min: 2, max: 0.5`` is not in doubt — and ``loco validate``
+        warns about it separately.
+        """
         if isinstance(think_time, dict):
-            min_wait = _safe_float(think_time.get("min"), 0.5)
-            max_wait = _safe_float(think_time.get("max"), min_wait)
+            min_wait = max(0.0, _safe_float(think_time.get("min"), 0.5))
+            max_wait = max(0.0, _safe_float(think_time.get("max"), min_wait))
+            if max_wait < min_wait:
+                min_wait, max_wait = max_wait, min_wait
             return f"between({min_wait}, {max_wait})"
         if think_time is not None:
-            value = _safe_float(think_time, 1.0)
+            value = max(0.0, _safe_float(think_time, 1.0))
             return f"between({value}, {value})"
         return None
 
@@ -744,14 +1137,16 @@ class ScenarioGenerator:
         """
         method = str(req.get("method", "GET")).upper()
         path = str(req.get("path"))
-        name = req.get("name") or f"{method} {path}"
+        # A YAML name like `name: 2024` arrives as an int; locust needs a str
+        # to group stats rows under.
+        name = str(req.get("name") or f"{method} {path}")
 
         # Resolve dynamic path segments at runtime, but keep the template
         # string as the stats name so Locust groups all calls together.
         if "${" in path:
-            path_expr = f"{user_expr}._resolve({repr(path)})"
+            path_expr = f"{user_expr}._resolve({_literal(path)})"
         else:
-            path_expr = repr(path)
+            path_expr = _literal(path)
 
         req_headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}
         params = req.get("query") if isinstance(req.get("query"), dict) else None
@@ -759,23 +1154,32 @@ class ScenarioGenerator:
         data_body = req.get("data")
         timeout = req.get("timeout")
 
-        args: List[str] = [repr(method), path_expr]
-        kwargs: List[str] = [f"name={repr(name)}"]
+        args: List[str] = [_literal(method), path_expr]
+        kwargs: List[str] = [f"name={_literal(name)}"]
 
         if req_headers:
             kwargs.append(
-                f"headers={user_expr}._resolve_dict({{**{user_expr}._base_headers, **{repr(req_headers)}}})"
+                f"headers={user_expr}._resolve_dict({{**{user_expr}._base_headers, **{_literal(req_headers)}}})"
             )
         else:
             kwargs.append(f"headers={user_expr}._resolve_dict({user_expr}._base_headers)")
         if params:
-            kwargs.append(f"params={user_expr}._resolve_dict({repr(params)})")
+            kwargs.append(f"params={user_expr}._resolve_dict({_literal(params)})")
         if json_body is not None:
-            kwargs.append(f"json={user_expr}._resolve_dict({repr(json_body)})")
-        if data_body is not None:
-            kwargs.append(f"data={user_expr}._resolve_dict({repr(data_body)})")
+            # _resolve_json, not _resolve_dict: a JSON body is the one place
+            # where "7" and 7 are different things to the server.
+            kwargs.append(f"json={user_expr}._resolve_json({_literal(json_body)})")
+        # 'json' and 'data' both fill the request body; requests would send the
+        # form body and drop the JSON one silently. 'loco validate' rejects the
+        # combination, and here 'json' wins so the two never disagree.
+        if data_body is not None and json_body is None:
+            kwargs.append(f"data={user_expr}._resolve_dict({_literal(data_body)})")
         if timeout is not None:
-            kwargs.append(f"timeout={repr(timeout)}")
+            # A YAML `timeout: "5"` is a string; requests raises a TypeError on
+            # it mid-run, after the whole load test has already started.
+            seconds = _safe_float(timeout, 0.0)
+            if seconds > 0:
+                kwargs.append(f"timeout={seconds}")
 
         return ", ".join(args + kwargs)
 
@@ -787,49 +1191,50 @@ class ScenarioGenerator:
     ) -> List[str]:
         """Generate the request call plus optional capture / assertion handling.
 
-        Three shapes:
+        Two shapes:
           - plain request (no capture, no expect): a bare ``client.request(...)``
-          - capture only: assign to ``resp`` and pull captured vars out of json
-          - expect present: wrap in a ``catch_response=True`` block so failed
-            assertions can mark the sample as a failure in Locust's stats
+            whose success is judged by Locust itself
+          - capture and/or expect: a ``catch_response=True`` block, so a failed
+            assertion *or* a capture that found nothing marks the sample as a
+            failure instead of quietly poisoning a later step with an empty
+            variable
         """
         pad = " " * indent
         call = self._build_request_call(req, user_expr)
+
+        # Every ${data:} placeholder in this request resolves against the same
+        # pool row; the scope is reset here, right before the call is built.
+        prelude: List[str] = []
+        if self._needs_request_scope:
+            prelude.append(f"{pad}{user_expr}._begin_request()")
 
         capture = req.get("capture")
         has_capture = isinstance(capture, dict) and bool(capture)
         expect = req.get("expect")
         has_expect = isinstance(expect, dict) and bool(expect)
 
-        def _capture_lines(resp_pad: str) -> List[str]:
-            out: List[str] = []
-            for var_name, json_path in capture.items():
-                # Simple json path like "token" or "data.access_token"
-                accessor = "data"
-                for part in str(json_path).split("."):
-                    accessor += f"[{repr(part)}]"
-                out.append(f"{resp_pad}try:")
-                out.append(f"{resp_pad}    data = resp.json()")
-                out.append(f"{resp_pad}    {user_expr}._vars[{repr(str(var_name))}] = {accessor}")
-                out.append(f"{resp_pad}except Exception:")
-                out.append(f"{resp_pad}    {user_expr}._vars[{repr(str(var_name))}] = None")
-            return out
+        if not has_capture and not has_expect:
+            return prelude + [f"{pad}self.client.request({call})"]
 
-        if not has_expect:
-            if not has_capture:
-                return [f"{pad}self.client.request({call})"]
-            lines = [f"{pad}resp = self.client.request({call})"]
-            lines.extend(_capture_lines(pad))
-            return lines
-
-        # expect present: mark the sample success/failure explicitly.
         inner = pad + "    "
-        lines = [f"{pad}with self.client.request({call}, catch_response=True) as resp:"]
-        if has_capture:
-            lines.extend(_capture_lines(inner))
-        lines.append(
-            f"{inner}_fails = {user_expr}._assert_response(resp, {user_expr}._resolve_dict({repr(expect)}))"
+        lines = prelude + [f"{pad}with self.client.request({call}, catch_response=True) as resp:"]
+
+        # catch_response suppresses Locust's own status check, so the implicit
+        # one runs even when there is no 'expect' block.
+        expect_arg = (
+            f"{user_expr}._resolve_dict({_literal(expect)})" if has_expect else "{}"
         )
+        lines.append(f"{inner}_fails = {user_expr}._assert_response(resp, {expect_arg})")
+
+        if has_capture:
+            spec = {str(k): str(v) for k, v in capture.items()}
+            lines.append(f"{inner}_capture_fails = {user_expr}._capture(resp, {_literal(spec)})")
+            lines.append(
+                f"{inner}# A response that already failed explains itself; "
+                "capture errors on top of it are noise."
+            )
+            lines.append(f"{inner}_fails = _fails or _capture_fails")
+
         lines.append(f"{inner}if _fails:")
         lines.append(f"{inner}    resp.failure('; '.join(_fails))")
         lines.append(f"{inner}else:")
@@ -897,7 +1302,7 @@ class ScenarioGenerator:
         basic_auth = self._auth_config(base_headers)
 
         # Store base headers as class attribute (placeholders resolved per request)
-        lines.append(f"    _base_headers = {repr(base_headers)}")
+        lines.append(f"    _base_headers = {_literal(base_headers)}")
 
         # Flows participate in scheduling alongside flat @task methods
         if flow_entries:
@@ -999,7 +1404,11 @@ class ScenarioGenerator:
         return lines
 
 
-def _write_locustfile(generators: List[ScenarioGenerator], output_dir: Path) -> Path:
+def _write_locustfile(
+    generators: List[ScenarioGenerator],
+    output_dir: Path,
+    shard_data: bool = True,
+) -> Path:
     """Prepare all personas, merge data pools, and write the locustfile."""
     merged_specs: Dict[str, Dict[str, Any]] = {}
     for gen in generators:
@@ -1014,7 +1423,7 @@ def _write_locustfile(generators: List[ScenarioGenerator], output_dir: Path) -> 
             merged_specs[name] = spec
 
     lines = _emit_imports()
-    lines.extend(_emit_helpers())
+    lines.extend(_emit_helpers(shard_data))
     lines.extend(_emit_data_layer(merged_specs))
     lines.extend(_emit_runtime_mixin())
     for gen in generators:
@@ -1092,4 +1501,5 @@ def generate_locustfile(
         generators = _build_persona_generators(users, target)
     else:
         generators = [ScenarioGenerator(scenario or {}, target)]
-    return _write_locustfile(generators, output_dir)
+    shard_data = (target or {}).get("shard_data", True)
+    return _write_locustfile(generators, output_dir, shard_data=shard_data is not False)

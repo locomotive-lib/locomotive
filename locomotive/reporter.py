@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,9 +15,66 @@ from .report_config import (
     ChartDatasetConfig,
     KpiCardConfig,
     ReportConfig,
+    css_name,
+    css_value,
     resolve_report_config,
 )
 from .utils import utc_now
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers
+#
+# The report is one HTML file built by string concatenation, and almost
+# everything in it — the title, chart labels, theme colours, the timezone
+# suffix, endpoint names straight out of the target's URLs — comes from
+# somewhere other than this module. ``html.escape`` covers the body, but a
+# ``<style>`` block and a ``<script>`` block have their own rules: neither
+# parses entities, and both end at the first matching close tag *inside* the
+# text. So a colour of ``red} </style><script>...`` or a chart label
+# containing ``</script>`` walks straight out of its element. These three
+# helpers are the answer for the three places that isn't plain HTML.
+# ---------------------------------------------------------------------------
+
+def _js_json(value: Any) -> str:
+    """``json.dumps`` for a value that will sit inside a ``<script>`` block.
+
+    JSON's own escaping leaves ``<`` alone, so a string containing
+    ``</script>`` ends the script element and everything after it becomes
+    markup. Escaping the three characters that can start a tag keeps the
+    payload identical to JavaScript while making it inert to the HTML parser.
+    """
+    encoded = json.dumps(value)
+    for char, escaped in (
+        ("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+        # Not markup, but a literal line separator ends a JS string.
+        (" ", "\\u2028"), (" ", "\\u2029"),
+    ):
+        encoded = encoded.replace(char, escaped)
+    return encoded
+
+
+_DOM_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _dom_id(prefix: str, raw: Any, suffix: str = "") -> str:
+    """A DOM id built from config text.
+
+    Chart ids are made of dictionary keys and metric names out of the config,
+    and they are written into an ``id`` attribute *and* into
+    ``getElementById`` — so a quote in one of them breaks the attribute and a
+    stray character breaks the pairing between the two. Reducing them to the
+    id alphabet keeps both halves in step.
+    """
+    return f"{prefix}{_DOM_ID_UNSAFE_RE.sub('_', str(raw))}{suffix}"
+
+
+def _chart_canvas_id(name: Any) -> str:
+    return _dom_id("", name, "Chart")
+
+
+def _trend_canvas_id(metric: Any) -> str:
+    return _dom_id("trendChart_", metric)
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +86,9 @@ def _format_value(value: Any, decimals: int = 2) -> str:
         return "-"
     if isinstance(value, float):
         return f"{value:.{decimals}f}"
-    return str(value)
+    # Metrics are usually numbers, but ``baseline.json`` is a file on disk and
+    # a string that lands here is written into a table cell.
+    return html.escape(str(value))
 
 
 def _format_delta(value: Any) -> str:
@@ -55,6 +115,7 @@ def _status_class(status: str) -> str:
         "PASS":        "status-pass",
         "WARNING":     "status-warning",
         "DEGRADATION": "status-fail",
+        "NO_DATA":     "status-nodata",
         "SKIP":        "status-skip",
     }.get(status, "status-unknown")
 
@@ -256,6 +317,7 @@ class ReportRenderer:
       --warn: #d97706; --warn-bg: #fef3c7;
       --fail: #dc2626; --fail-bg: #fee2e2;
       --skip: #6b7280; --skip-bg: #f3f4f6;
+      --nodata: #7c3aed; --nodata-bg: #ede9fe;
       --bg: #f8fafc; --card: #ffffff; --line: #e2e8f0;
       --text: #1e293b; --text-muted: #64748b;
       --primary: #3b82f6; --primary-light: #dbeafe;
@@ -281,6 +343,7 @@ class ReportRenderer:
     .status-badge-large.pass    { background: var(--pass-bg); color: var(--pass); }
     .status-badge-large.warning { background: var(--warn-bg); color: var(--warn); }
     .status-badge-large.fail    { background: var(--fail-bg); color: var(--fail); }
+    .status-badge-large.nodata  { background: var(--nodata-bg); color: var(--nodata); }
     .meta { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
     .meta-ids { font-family: monospace; font-size: 12px; }
 
@@ -348,6 +411,7 @@ class ReportRenderer:
     .status-warning { color: var(--warn); font-weight: 600; }
     .status-fail    { color: var(--fail); font-weight: 600; }
     .status-skip    { color: var(--skip); }
+    .status-nodata  { color: var(--nodata); font-weight: 600; }
 
     .status-summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
     .status-badge { padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; }
@@ -355,6 +419,7 @@ class ReportRenderer:
     .status-badge.warning { background: var(--warn-bg); color: var(--warn); }
     .status-badge.fail    { background: var(--fail-bg); color: var(--fail); }
     .status-badge.skip    { background: var(--skip-bg); color: var(--skip); }
+    .status-badge.nodata  { background: var(--nodata-bg); color: var(--nodata); }
 
     .info-message {
       background: var(--warn-bg); border: 1px solid #fbbf24;
@@ -386,14 +451,20 @@ class ReportRenderer:
         if not colors and not self.cfg.branding.color:
             return ""
         parts: List[str] = []
-        if colors:
-            lines = ["    :root {"]
-            for var, val in colors.items():
-                lines.append(f"      --{var}: {val};")
-            lines.append("    }")
-            parts.append("\n".join(lines))
-        if self.cfg.branding.color:
-            parts.append(f"    .footer .brand-name {{ color: {self.cfg.branding.color}; }}")
+        # Names and values are checked rather than escaped: CSS has no entity
+        # syntax to escape *into*, so anything that isn't recognisably a
+        # colour is left out of the stylesheet entirely. `loco validate` says
+        # so before the run, which is where a typo should be caught.
+        declarations = []
+        for var, val in colors.items():
+            name, value = css_name(var), css_value(val)
+            if name and value:
+                declarations.append(f"      --{name}: {value};")
+        if declarations:
+            parts.append("\n".join(["    :root {", *declarations, "    }"]))
+        brand = css_value(self.cfg.branding.color) if self.cfg.branding.color else None
+        if brand:
+            parts.append(f"    .footer .brand-name {{ color: {brand}; }}")
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -479,13 +550,34 @@ class ReportRenderer:
             f"      <div>\n"
             f'        <h1 class="title">{title_safe}</h1>\n'
             f'        <div class="meta">\n'
-            f"          Generated at {self.generated_at}<br>\n"
-            f'          <span class="meta-ids">Run: {run_id} | Baseline: {baseline_id}</span>\n'
+            # The timezone name is config text and rides along in this string.
+            f"          Generated at {html.escape(self.generated_at)}<br>\n"
+            f'          <span class="meta-ids">Run: {run_id} | Baseline: {baseline_id}'
+            f"{self._topology_note()}</span>\n"
             f"        </div>\n"
             f"      </div>\n"
             f'      <div class="status-badge-large {badge_cls}">{html.escape(self.status)}</div>\n'
             f"    </div>"
         )
+
+    def _topology_note(self) -> str:
+        """How many processes generated this load, when it was more than one.
+
+        Throughput is not comparable between a one-process run and an
+        eight-process one, and the difference is invisible in every number
+        on the page. A run that used one process says nothing — that is the
+        assumption a reader already has.
+        """
+        topology = self.run_meta.get("topology")
+        if not isinstance(topology, dict):
+            return ""
+        try:
+            generators = int(topology.get("load_generators") or 1)
+        except (TypeError, ValueError):
+            return ""
+        if generators < 2:
+            return ""
+        return f" | Load generators: {generators}"
 
     # ------------------------------------------------------------------
     # KPI cards
@@ -518,9 +610,11 @@ class ReportRenderer:
             if card.format == "duration":
                 value_html = _format_duration(val)
             else:
-                value_html = card.format.format(value=val)
+                # `format` is a template out of the config — "{value:.2f}" is
+                # the point, but so is everything else the user typed around it.
+                value_html = html.escape(card.format.format(value=val))
         except (ValueError, TypeError, KeyError):
-            value_html = str(raw)
+            value_html = html.escape(str(raw))
 
         unit_html = (
             f'<span class="kpi-unit">{html.escape(card.unit)}</span>' if card.unit else ""
@@ -553,9 +647,9 @@ class ReportRenderer:
             return ""
         cards = []
         for name, cfg in enabled:
-            canvas = f"{name}Chart"
+            canvas = _chart_canvas_id(name)
             content = f'<div class="chart-container"><canvas id="{canvas}"></canvas></div>'
-            cards.append(self._card(html.escape(cfg.title or name), content))
+            cards.append(self._card(html.escape(cfg.title or str(name)), content))
         return self._charts_grid(cards)
 
     # ------------------------------------------------------------------
@@ -576,6 +670,7 @@ class ReportRenderer:
                 f'<span class="status-badge pass">{s.get("PASS", 0)} PASS</span>'
                 f'<span class="status-badge warning">{s.get("WARNING", 0)} WARN</span>'
                 f'<span class="status-badge fail">{s.get("DEGRADATION", 0)} FAIL</span>'
+                f'<span class="status-badge nodata">{s.get("NO_DATA", 0)} NO DATA</span>'
                 f'<span class="status-badge skip">{s.get("SKIP", 0)} SKIP</span>'
                 "</div>"
             )
@@ -675,9 +770,11 @@ class ReportRenderer:
         cards: List[str] = []
         for metric in self.cfg.trends.metrics:
             label = METRIC_LABELS.get(metric, metric)
-            canvas_id = f"trendChart_{metric}"
+            canvas_id = _trend_canvas_id(metric)
             content = f'<div class="chart-container"><canvas id="{canvas_id}"></canvas></div>'
-            cards.append(self._card(f"{label} — last {n} runs", content))
+            # `trends.metrics` is a list the user writes, and an unknown metric
+            # is used as its own label — so this title is user text.
+            cards.append(self._card(f"{html.escape(str(label))} — last {n} runs", content))
         if not cards:
             return ""
         return (
@@ -714,14 +811,14 @@ class ReportRenderer:
         if self.has_charts:
             enabled = [(n, c) for n, c in self.cfg.charts.items() if c.enabled]
             if enabled:
-                parts.append(f"const chartData = {json.dumps(self.chart_data)};")
+                parts.append(f"const chartData = {_js_json(self.chart_data)};")
                 for name, cfg in enabled:
-                    parts.append(self._chart_init(f"{name}Chart", cfg))
+                    parts.append(self._chart_init(_chart_canvas_id(name), cfg))
 
         # Trend charts
         if "trends" in self.cfg.sections and len(self.history_runs) >= 2:
             trends_json = self._build_trends_js_data()
-            parts.append(f"const trendsData = {json.dumps(trends_json)};")
+            parts.append(f"const trendsData = {_js_json(trends_json)};")
             for metric in self.cfg.trends.metrics:
                 parts.append(self._trend_chart_init(metric))
 
@@ -751,7 +848,7 @@ class ReportRenderer:
             )
 
         return (
-            f"new Chart(document.getElementById({json.dumps(canvas_id)}), {{\n"
+            f"new Chart(document.getElementById({_js_json(canvas_id)}), {{\n"
             f"      type: 'line',\n"
             f"      data: {{\n"
             f"        labels: chartData.labels.map(t => t + 's'),\n"
@@ -770,14 +867,14 @@ class ReportRenderer:
 
     def _dataset_js(self, ds: ChartDatasetConfig) -> str:
         bg = f"{ds.color}26" if ds.fill else "transparent"
-        dash = f", borderDash: {json.dumps(ds.dash)}" if ds.dash else ""
+        dash = f", borderDash: {_js_json(ds.dash)}" if ds.dash else ""
         y_id = "y1" if ds.y_axis == "right" else "y"
         return (
-            f"{{ label: {json.dumps(ds.label)}, data: chartData.{ds.key}, "
-            f"borderColor: {json.dumps(ds.color)}, backgroundColor: {json.dumps(bg)}, "
+            f"{{ label: {_js_json(ds.label)}, data: chartData.{ds.key}, "
+            f"borderColor: {_js_json(ds.color)}, backgroundColor: {_js_json(bg)}, "
             f"fill: {'true' if ds.fill else 'false'}, tension: 0.3, "
             f"pointRadius: 0, pointHitRadius: 8, borderWidth: 2, "
-            f"yAxisID: {json.dumps(y_id)}{dash} }}"
+            f"yAxisID: {_js_json(y_id)}{dash} }}"
         )
 
     def _build_trends_js_data(self) -> Dict[str, Any]:
@@ -821,17 +918,17 @@ class ReportRenderer:
             point_sizes[-1]  = 7
 
         return (
-            f"new Chart(document.getElementById({json.dumps(canvas_id)}), {{\n"
+            f"new Chart(document.getElementById({_js_json(canvas_id)}), {{\n"
             f"      type: 'line',\n"
             f"      data: {{\n"
             f"        labels: trendsData.labels,\n"
             f"        datasets: [{{\n"
-            f"          label: {json.dumps(label)},\n"
-            f"          data: trendsData[{json.dumps(metric)}].values,\n"
-            f"          borderColor: {json.dumps(color)},\n"
-            f"          backgroundColor: {json.dumps(color + '19')},\n"
-            f"          pointBackgroundColor: {json.dumps(point_colors)},\n"
-            f"          pointRadius: {json.dumps(point_sizes)},\n"
+            f"          label: {_js_json(label)},\n"
+            f"          data: trendsData[{_js_json(metric)}].values,\n"
+            f"          borderColor: {_js_json(color)},\n"
+            f"          backgroundColor: {_js_json(color + '19')},\n"
+            f"          pointBackgroundColor: {_js_json(point_colors)},\n"
+            f"          pointRadius: {_js_json(point_sizes)},\n"
             f"          fill: true, tension: 0.3\n"
             f"        }}]\n"
             f"      }},\n"
@@ -841,7 +938,7 @@ class ReportRenderer:
             f"        plugins: {{ legend: {{ position: 'top' }} }},\n"
             f"        scales: {{\n"
             f"          x: {{ title: {{ display: true, text: 'Run' }} }},\n"
-            f"          y: {{ title: {{ display: true, text: {json.dumps(label)} }}, min: 0 }}\n"
+            f"          y: {{ title: {{ display: true, text: {_js_json(label)} }}, min: 0 }}\n"
             f"        }}\n"
             f"      }}\n"
             f"    }});"

@@ -3,13 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .analyzer import analyze as analyze_metrics
-from .analyzer import load_rules, merge_results
-from .config import load_config
+from .analyzer import load_rules, merge_results, sanity_results, topology_results
+from .config import load_config, load_config_raw
 from .gate import evaluate_gate, summarize_history
 from .launcher import LocustLauncher, find_stats_history_csv, parse_locust_stats_history
 from .reporter import render_report, load_stats_history, load_endpoint_stats
@@ -108,6 +110,16 @@ def _load_rules_from_sources(rules_path: Optional[str], inline_rules: Optional[L
     return []
 
 
+def _load_run_meta(storage: Storage, run_id: str) -> Dict[str, Any]:
+    """A run's ``run.json``, or an empty dict for a run that has none.
+
+    Runs recorded before a given field existed simply do not have it, and
+    that has to read as "unknown", not as a difference.
+    """
+    path = storage.run_meta_path(run_id)
+    return storage.load_json(path) if path.exists() else {}
+
+
 def _build_storage(args: argparse.Namespace, config: Dict[str, Any]) -> Storage:
     artifacts = _get_section(config, "artifacts")
     storage_root = args.storage or artifacts.get("storage") or "artifacts"
@@ -141,6 +153,50 @@ def _build_locust_config(args: argparse.Namespace, config: Dict[str, Any]) -> Di
         "headers": headers,
         "meta": {"ci": _collect_ci_meta()},
     }
+    # Absent and `null` mean different things — no key means "derive a budget
+    # from run_time", `null` means "wait as long as it takes" — so the key is
+    # only set when the config actually carries one.
+    if "timeout" in locust_cfg:
+        merged["timeout"] = locust_cfg["timeout"]
+    merged.update(_merge_topology(args, locust_cfg))
+    return merged
+
+
+def _merge_topology(
+    args: argparse.Namespace, locust_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Distribution settings, flag beating config.
+
+    ``--master`` and ``--worker`` are store_true, so the flag can only ever
+    turn a role on; ``master: false`` in the config with ``--master`` on the
+    command line means the command line. Everything else is "None means the
+    config had its say".
+    """
+    merged: Dict[str, Any] = {
+        "processes": (
+            _parse_int(args.processes, "processes")
+            if getattr(args, "processes", None) is not None
+            else _parse_int(locust_cfg.get("processes"), "processes")
+        ),
+        "expect_workers": (
+            _parse_int(args.expect_workers, "expect_workers")
+            if getattr(args, "expect_workers", None) is not None
+            else _parse_int(locust_cfg.get("expect_workers"), "expect_workers")
+        ),
+        "master": bool(getattr(args, "master", False)) or bool(locust_cfg.get("master")),
+        "worker": bool(getattr(args, "worker", False)) or bool(locust_cfg.get("worker")),
+        "master_host": getattr(args, "master_host", None) or locust_cfg.get("master_host"),
+        "master_port": (
+            _parse_int(args.master_port, "master_port")
+            if getattr(args, "master_port", None) is not None
+            else _parse_int(locust_cfg.get("master_port"), "master_port")
+        ),
+        # Read by the generator, not the launcher: it decides whether the
+        # generated file divides its data pools between workers.
+        "shard_data": locust_cfg.get("shard_data", True) is not False,
+    }
+    if getattr(args, "no_shard_data", False):
+        merged["shard_data"] = False
     return merged
 
 
@@ -265,20 +321,62 @@ def _report(
     return str(output_path or run_report)
 
 
+FAIL_ON_LEVELS = ("WARNING", "DEGRADATION")
+
+
+def _is_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_fail_on(args_value: Any, analysis_cfg: Dict[str, Any]) -> str:
+    """Resolve fail_on from CLI/config, case-insensitively.
+
+    A lowercase 'degradation' in the config used to compare unequal to
+    'DEGRADATION' and silently disable the build ever failing.
+    """
+    raw = args_value or analysis_cfg.get("fail_on") or "DEGRADATION"
+    fail_on = str(raw).strip().upper()
+    if fail_on not in FAIL_ON_LEVELS:
+        print(
+            f"Warning: unknown fail_on {raw!r}; expected one of "
+            f"{', '.join(FAIL_ON_LEVELS)}. Falling back to DEGRADATION."
+        )
+        return "DEGRADATION"
+    return fail_on
+
+
+def _downgrade_no_data(result_sets: List[List[Dict[str, Any]]]) -> None:
+    """Turn NO_DATA into SKIP, for users who opt into analysis.allow_no_data."""
+    for results in result_sets:
+        for res in results or []:
+            if res.get("status") == "NO_DATA":
+                res["status"] = "SKIP"
+                reason = res.get("reason") or "no data"
+                res["reason"] = f"{reason} (allowed by allow_no_data)"
+
+
 def _gate_status(gate_eval: Dict[str, Any]) -> str:
     """Derive a single status from gate evaluation results only."""
     results = gate_eval.get("results") or []
     statuses = [r.get("status") for r in results if r.get("status") not in (None, "SKIP")]
     if not statuses:
-        return "PASS"
-    if "DEGRADATION" in statuses:
-        return "DEGRADATION"
-    if "WARNING" in statuses:
-        return "WARNING"
+        # Thresholds were configured but not one of them was actually
+        # evaluated. That is the opposite of a pass.
+        return "NO_DATA"
+    for level in ("DEGRADATION", "NO_DATA", "WARNING"):
+        if level in statuses:
+            return level
     return "PASS"
 
 
 def _exit_code_for_status(status: str, fail_on: str) -> int:
+    if status == "NO_DATA":
+        # Independent of fail_on: nothing was measured, so nothing was proven.
+        return 1
     if fail_on == "WARNING" and status in {"WARNING", "DEGRADATION"}:
         return 1
     if fail_on == "DEGRADATION" and status == "DEGRADATION":
@@ -305,6 +403,13 @@ def cmd_diff(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         print(f"Error: OpenAPI spec not found: {spec_path}")
         return 1
     spec = load_spec(spec_path)
+    # Re-read the config unsubstituted: a path param written as
+    # ${PATH_ID:-1} is a parameter, and comparing the resolved "/users/1"
+    # against the spec's "/users/{id}" made every scaffolded config drift.
+    try:
+        config = load_config_raw(args.config)
+    except (OSError, ValueError):
+        pass  # fall back to the already-loaded config
     findings = diff_config_spec(config, spec)
     print(format_findings(findings))
     if args.exit_zero:
@@ -329,8 +434,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     """Initialize a new loconfig configuration."""
     output_path = Path(args.output)
     openapi_path = Path(args.openapi) if args.openapi else None
-    host = args.host or "http://localhost:8000"
-    
+    # Left as None when the flag was not given, so a host declared by the spec
+    # can win over the localhost fallback.
+    host = args.host
+
     if output_path.exists() and not args.force:
         print(f"Error: {output_path} already exists. Use --force to overwrite.")
         return 1
@@ -387,6 +494,8 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     rules_path = args.rules or analysis_cfg.get("rules_file")
     inline_rules = analysis_cfg.get("rules")
 
+    current_metrics = storage.load_json(storage.metrics_path(run_id))
+
     result_sets: List[List[Dict[str, Any]]] = []
     baseline_results = None
     if baseline_id:
@@ -395,12 +504,26 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
 
     gate_eval = None
     if mode:
-        current_metrics = storage.load_json(storage.metrics_path(run_id))
         warmup_seconds = gate_cfg.get("warmup_seconds")
         history_summary = _load_history_summary(storage, run_id, _parse_int(warmup_seconds, "warmup_seconds") if warmup_seconds is not None else None)
         gate_eval = evaluate_gate(current_metrics, gate_cfg, mode, history_summary)
         if gate_eval:
             result_sets.append(gate_eval.get("results") or [])
+
+    # A run that recorded nothing must not pass by virtue of having no numbers
+    # to compare. This check applies even when no rules and no gate are set.
+    sanity = sanity_results(current_metrics)
+    if sanity:
+        result_sets.append(sanity)
+    if baseline_id:
+        drift = topology_results(
+            _load_run_meta(storage, run_id), _load_run_meta(storage, baseline_id)
+        )
+        if drift:
+            result_sets.append(drift)
+
+    if _is_true(analysis_cfg.get("allow_no_data")):
+        _downgrade_no_data(result_sets)
 
     if result_sets:
         combined = merge_results(result_sets)
@@ -411,7 +534,7 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
             combined["gate"] = gate_eval.get("gate")
         storage.save_json(storage.analysis_path(run_id), combined)
 
-        fail_on = args.fail_on or analysis_cfg.get("fail_on") or "DEGRADATION"
+        fail_on = _resolve_fail_on(args.fail_on, analysis_cfg)
         return _exit_code_for_status(combined.get("status"), fail_on)
 
     return 0
@@ -446,6 +569,16 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     _maybe_generate_locustfile(storage, run_id, locust_config, config)
     run_result = _run(storage, run_id, locust_config)
 
+    if (run_result.get("topology") or {}).get("role") == "worker":
+        # A worker generates load and reports it to the master; the master
+        # writes the CSVs, so there is nothing here to analyse, gate or
+        # report on. Falling through would reach `if not metrics_exist:
+        # return locust_code or 1` and turn a worker that did its job into a
+        # failed CI step.
+        code = int(run_result.get("returncode") or 0)
+        print(f"Worker finished (exit {code}); the master holds the results.")
+        return code
+
     analysis_cfg = _get_section(config, "analysis")
     report_cfg = _get_section(config, "report")
     mode, gate_cfg = _resolve_gate_config(analysis_cfg)
@@ -474,6 +607,23 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         if gate_eval:
             result_sets.append(gate_eval.get("results") or [])
 
+    # A run that recorded nothing must not pass by virtue of having no numbers
+    # to compare — see sanity_results().
+    sanity: List[Dict[str, Any]] = []
+    if metrics_exist:
+        sanity = sanity_results(storage.load_json(metrics_path))
+        if sanity:
+            result_sets.append(sanity)
+        if baseline_id:
+            drift = topology_results(
+                _load_run_meta(storage, run_id), _load_run_meta(storage, baseline_id)
+            )
+            if drift:
+                result_sets.append(drift)
+
+    if _is_true(analysis_cfg.get("allow_no_data")):
+        _downgrade_no_data(result_sets)
+
     if result_sets:
         combined = merge_results(result_sets)
         combined["run_id"] = run_id
@@ -485,8 +635,10 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         analysis = combined
 
     locust_code = int(run_result.get("returncode") or 0)
+    rules_advisory = _is_true(analysis_cfg.get("rules_advisory"))
     set_baseline = False
-    if args.set_baseline and metrics_exist:
+    sanity_failed = any(res.get("status") == "NO_DATA" for res in sanity)
+    if args.set_baseline and metrics_exist and not sanity_failed:
         if gate_eval:
             # When gate is configured, use gate status for baseline eligibility.
             # Regression rules may fluctuate between runs and should not block baseline.
@@ -516,18 +668,26 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     if not metrics_exist:
         return locust_code or 1
 
+    code = 0
     if analysis:
-        fail_on = args.fail_on or analysis_cfg.get("fail_on") or "DEGRADATION"
-        # When gate is configured, use gate status for exit code.
-        # Regression rules are shown in the report but do not fail the build
-        # — they compare against baseline which can vary between runs.
-        if gate_eval:
-            return _exit_code_for_status(_gate_status(gate_eval), fail_on)
-        return _exit_code_for_status(analysis.get("status"), fail_on)
+        fail_on = _resolve_fail_on(args.fail_on, analysis_cfg)
+        if rules_advisory and gate_eval:
+            # Opt-in legacy behaviour: baseline regression rules are reported
+            # but only the gate (plus sanity checks) decides the exit code.
+            status = _gate_status(gate_eval)
+            if sanity_failed:
+                status = "NO_DATA"
+        else:
+            # Default: everything that was evaluated counts. 'loco ci' and
+            # 'loco analyze' now agree on the same artifacts.
+            status = analysis.get("status")
+        code = _exit_code_for_status(status, fail_on)
 
-    if locust_code != 0:
-        return locust_code
-    return 0
+    if code:
+        return code
+    # locust's own exit code (non-zero on --exit-code-on-error, interrupted or
+    # crashed runs) must not be swallowed just because the analysis was clean.
+    return locust_code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -536,6 +696,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Locomotive - CI/CD load testing runner and regression analyzer for Locust",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to config JSON/YAML")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show the full traceback when a command fails (also LOCO_DEBUG=1)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -593,6 +758,39 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--locust-cmd", help="Custom locust command")
     parser.add_argument("--set-baseline", action="store_true", help="Set this run as baseline")
     parser.add_argument("--no-validate", action="store_true", help="Skip static config validation before running")
+    _add_distributed_args(parser)
+
+
+def _add_distributed_args(parser: argparse.ArgumentParser) -> None:
+    """Flags for spreading the load over more than one process.
+
+    ``--users`` and ``--spawn-rate`` stay cluster-wide totals under all of
+    these: locust divides them between workers itself, so `-u 500
+    --processes 8` is five hundred users in total, not four thousand.
+    """
+    group = parser.add_argument_group("distributed load")
+    group.add_argument(
+        "--processes",
+        help="Fork N load-generating processes on this machine (locust does the split)",
+    )
+    group.add_argument(
+        "--master", action="store_true",
+        help="Run as the master of a cluster: aggregates, gates and reports, generates no load",
+    )
+    group.add_argument(
+        "--worker", action="store_true",
+        help="Run as a worker: generates load and reports to a master, writes no artifacts",
+    )
+    group.add_argument("--master-host", help="Master address for --worker (default 127.0.0.1)")
+    group.add_argument("--master-port", help="Master port for --worker (default 5557)")
+    group.add_argument(
+        "--expect-workers",
+        help="How many workers the master waits for; also the denominator for data pool sharding",
+    )
+    group.add_argument(
+        "--no-shard-data", action="store_true",
+        help="Give every worker the whole data pool instead of a disjoint slice",
+    )
 
 
 def _add_storage_args(parser: argparse.ArgumentParser) -> None:
@@ -611,33 +809,97 @@ def _add_report_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", help="Report output path")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    
-    # init command doesn't need config file
+# ── error reporting ───────────────────────────────────────────────────
+#
+# Everything below exists so that a mistake in a config file reads like a
+# message and not like a bug in Locomotive. A stray `weight: "ten"` used to
+# come back as forty lines of traceback ending in a ValueError raised deep in
+# ``scenario.py`` — accurate, and useless to the person whose CI job just went
+# red. Validation catches most of these before the run now; this is the net
+# under everything it cannot.
+
+_TRACEBACK_HINT = "Run with --debug (or LOCO_DEBUG=1) for the full traceback."
+
+
+def _debug_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "debug", False):
+        return True
+    return os.environ.get("LOCO_DEBUG", "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _error_message(exc: BaseException) -> str:
+    if isinstance(exc, FileNotFoundError):
+        target = exc.filename or (exc.args[1] if len(exc.args) > 1 else exc)
+        return f"file not found: {target}"
+    if isinstance(exc, IsADirectoryError):
+        return f"expected a file but found a directory: {exc.filename}"
+    if isinstance(exc, PermissionError):
+        return f"permission denied: {exc.filename}"
+    if isinstance(exc, json.JSONDecodeError):
+        return f"could not parse JSON: {exc}"
+    if isinstance(exc, OSError):
+        # Disk full, too many open files, a read-only artifacts directory.
+        where = f" ({exc.filename})" if exc.filename else ""
+        return f"{exc.strerror or exc}{where}"
+    text = str(exc).strip()
+    if type(exc).__module__.startswith("yaml"):
+        # yaml's own messages already carry line and column.
+        return f"could not parse YAML: {text}"
+    return text or type(exc).__name__
+
+
+def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    # init writes a config; it is the one command that must not need one.
     if args.command == "init":
         return cmd_init(args)
-    
+
     try:
         config = load_config(args.config)
     except FileNotFoundError:
-        print(f"Error: config file not found: {args.config}")
-        print(f"Run 'loco init' to create a default config.")
+        print(f"Error: config file not found: {args.config}", file=sys.stderr)
+        print("Run 'loco init' to create a default config.", file=sys.stderr)
         return 1
 
-    if args.command == "validate":
-        return cmd_validate(args, config)
-    if args.command == "diff":
-        return cmd_diff(args, config)
-    if args.command == "run":
-        return cmd_run(args, config)
-    if args.command == "analyze":
-        return cmd_analyze(args, config)
-    if args.command == "report":
-        return cmd_report(args, config)
-    if args.command == "ci":
-        return cmd_ci(args, config)
+    handlers = {
+        "validate": cmd_validate,
+        "diff": cmd_diff,
+        "run": cmd_run,
+        "analyze": cmd_analyze,
+        "report": cmd_report,
+        "ci": cmd_ci,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
+        parser.print_help()
+        return 1
+    return handler(args, config)
 
-    parser.print_help()
-    return 1
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return _run_command(args, parser)
+    except KeyboardInterrupt:
+        # The launcher handles Ctrl-C during a run and still writes artifacts;
+        # this is for the seconds on either side of it.
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except (ValueError, OSError) as exc:
+        if _debug_enabled(args):
+            traceback.print_exc()
+        print(f"Error: {_error_message(exc)}", file=sys.stderr)
+        if not _debug_enabled(args):
+            print(_TRACEBACK_HINT, file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - last line before a traceback
+        if _debug_enabled(args):
+            traceback.print_exc()
+            return 1
+        print(f"Error: {_error_message(exc)}", file=sys.stderr)
+        print(
+            f"This one is unexpected — {_TRACEBACK_HINT[0].lower()}{_TRACEBACK_HINT[1:]}",
+            file=sys.stderr,
+        )
+        return 1

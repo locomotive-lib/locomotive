@@ -5,7 +5,13 @@ import types
 
 import pytest
 
-from locomotive.scenario import ScenarioGenerator, _slugify, _safe_int, _safe_float
+from locomotive.scenario import (
+    ScenarioGenerator,
+    _literal,
+    _slugify,
+    _safe_int,
+    _safe_float,
+)
 
 
 # ── helpers: execute generated code with a stubbed locust ─────────────
@@ -105,12 +111,27 @@ def _exec_generated(tmp_path, scenario, target=None):
         def interrupt(self, reschedule=True):
             self.interrupted = True
 
+    class FakeEventHook:
+        """Locust's EventHook, as far as the generated file uses it."""
+
+        def __init__(self):
+            self.listeners = []
+
+        def add_listener(self, func):
+            self.listeners.append(func)
+            return func
+
+        def fire(self, **kwargs):
+            for listener in self.listeners:
+                listener(**kwargs)
+
     fake = types.ModuleType("locust")
     fake.HttpUser = type("HttpUser", (), {})
     fake.SequentialTaskSet = FakeSequentialTaskSet
     fake.task = fake_task
     fake.tag = lambda *tags: (lambda f: f)
     fake.between = lambda a, b: (a, b)
+    fake.events = types.SimpleNamespace(init=FakeEventHook())
 
     saved = sys.modules.get("locust")
     sys.modules["locust"] = fake
@@ -122,6 +143,11 @@ def _exec_generated(tmp_path, scenario, target=None):
             sys.modules["locust"] = saved
         else:
             sys.modules.pop("locust", None)
+    # The fake module is uninstalled again above, but the generated file's
+    # init listener is registered on *this* hook and tests still need to fire
+    # it. Hand the module back with the namespace rather than leaving tests to
+    # reach for a `sys.modules` entry that no longer exists.
+    namespace["_fake_locust"] = fake
     return namespace
 
 
@@ -240,6 +266,41 @@ class TestGenerate:
         content = _generate(tmp_path, scenario)
         assert "Bearer" in content
         assert "test-token" in content
+
+    def test_env_placeholder_in_auth_resolves_at_request_time(
+        self, tmp_path, monkeypatch
+    ):
+        # The config loader now leaves ${env:} in place; the locust process
+        # reads it, so the token never lands in the generated file.
+        monkeypatch.setenv("API_TOKEN", "s3cret")
+        scenario = {
+            "auth": {"type": "bearer", "token": "${env:API_TOKEN}"},
+            "requests": [{"name": "P", "method": "GET", "path": "/api"}],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_p()
+        assert user.client.calls[-1]["headers"]["Authorization"] == "Bearer s3cret"
+
+    def test_env_placeholder_in_body_resolves_at_request_time(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("MISSING_KEY", raising=False)
+        monkeypatch.setenv("TENANT", "acme")
+        scenario = {
+            "requests": [{
+                "name": "P", "method": "POST", "path": "/p/${env:TENANT}",
+                "json": {"k": "${env:MISSING_KEY:-fallback}"},
+            }],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_p()
+        call = user.client.calls[-1]
+        assert call["url"] == "/p/acme"
+        assert call["json"]["k"] == "fallback"
 
     def test_api_key_auth(self, tmp_path):
         scenario = {
@@ -880,6 +941,283 @@ class TestCaptureInFlatRequests:
         assert user.client.calls[-1]["url"] == "/items/abc"
 
 
+class TestCaptureFailsTheSample:
+    """A capture that finds nothing is a failed request.
+
+    It used to store None silently, so the run stayed green and the next step
+    hit `/orders/` instead of `/orders/42` — a 404 several lines away from the
+    actual cause.
+    """
+
+    SCENARIO = {
+        "requests": [
+            {"name": "List", "method": "GET", "path": "/items",
+             "capture": {"first": "items.0.id"}},
+        ],
+    }
+
+    def _run(self, tmp_path, payload, status_code=200, text=None):
+        ns = _exec_generated(tmp_path, self.SCENARIO)
+        user = ns["GeneratedUser"]()
+        user.client = StubClient(payload, status_code=status_code, text=text)
+        user.on_start()
+        user.task_1_list()
+        return user, user.client.responses[-1]
+
+    def test_present_value_succeeds(self, tmp_path):
+        user, resp = self._run(tmp_path, {"items": [{"id": 42}]})
+        assert user._vars["first"] == 42
+        assert resp.succeeded and not resp.failed
+
+    def test_missing_path_fails_the_sample(self, tmp_path):
+        user, resp = self._run(tmp_path, {"items": []})
+        assert user._vars["first"] is None
+        assert resp.failed
+        assert "first" in resp.failure_msg
+
+    def test_non_json_body_fails_the_sample(self, tmp_path):
+        ns = _exec_generated(tmp_path, self.SCENARIO)
+        user = ns["GeneratedUser"]()
+
+        class BrokenClient(StubClient):
+            def request(self, method, url, **kwargs):
+                resp = super().request(method, url, **kwargs)
+                resp.json = lambda: (_ for _ in ()).throw(ValueError("not json"))
+                return resp
+
+        user.client = BrokenClient({})
+        user.on_start()
+        user.task_1_list()
+        resp = user.client.responses[-1]
+        assert resp.failed
+        assert "not JSON" in resp.failure_msg
+
+    def test_captured_null_is_not_a_failure(self, tmp_path):
+        # A field that exists and is null is a real captured value.
+        user, resp = self._run(tmp_path, {"items": [{"id": None}]})
+        assert user._vars["first"] is None
+        assert resp.succeeded
+
+    def test_error_status_still_fails_without_expect(self, tmp_path):
+        # catch_response suppresses locust's own check; the implicit one runs.
+        user, resp = self._run(tmp_path, {"items": [{"id": 1}]}, status_code=500)
+        assert resp.failed
+        assert "500" in resp.failure_msg
+
+    def test_status_failure_hides_capture_noise(self, tmp_path):
+        user, resp = self._run(tmp_path, {}, status_code=500)
+        assert "500" in resp.failure_msg
+        assert "capture" not in resp.failure_msg
+
+    def test_plain_request_is_not_wrapped(self, tmp_path):
+        # No capture, no expect: locust judges the sample, no catch_response.
+        # (The mixin mentions catch_response in a comment, so match the call.)
+        content = _generate(
+            tmp_path, {"requests": [{"name": "P", "method": "GET", "path": "/p"}]}
+        )
+        assert "catch_response=True" not in content
+        assert "self.client.request(" in content
+
+
+class TestCaptureJsonPaths:
+    """B: capture paths reach into arrays and decode the body once."""
+
+    def _capture(self, tmp_path, path, payload):
+        scenario = {
+            "requests": [
+                {"name": "L", "method": "GET", "path": "/l", "capture": {"v": path}},
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns, payload)
+        user.on_start()
+        user.task_1_l()
+        return user._vars["v"]
+
+    @pytest.mark.parametrize("path", ["items.0.id", "items[0].id"])
+    def test_array_index_both_notations(self, tmp_path, path):
+        assert self._capture(tmp_path, path, {"items": [{"id": "a"}]}) == "a"
+
+    def test_negative_index(self, tmp_path):
+        assert self._capture(tmp_path, "items.-1", {"items": ["a", "b"]}) == "b"
+
+    def test_out_of_range_index_is_missing(self, tmp_path):
+        assert self._capture(tmp_path, "items.5", {"items": ["a"]}) is None
+
+    def test_root_array(self, tmp_path):
+        assert self._capture(tmp_path, "[1].id", [{"id": "x"}, {"id": "y"}]) == "y"
+
+    def test_nested_mix(self, tmp_path):
+        payload = {"data": {"orders": [{"lines": [{"sku": "S1"}]}]}}
+        assert self._capture(tmp_path, "data.orders[0].lines[0].sku", payload) == "S1"
+
+    def test_body_is_decoded_once_per_request(self, tmp_path):
+        scenario = {
+            "requests": [
+                {"name": "L", "method": "GET", "path": "/l",
+                 "capture": {"a": "x", "b": "y", "c": "z"}},
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        calls = {"n": 0}
+
+        class CountingClient(StubClient):
+            def request(self, method, url, **kwargs):
+                resp = super().request(method, url, **kwargs)
+                payload = {"x": 1, "y": 2, "z": 3}
+
+                def counted():
+                    calls["n"] += 1
+                    return payload
+
+                resp.json = counted
+                return resp
+
+        user.client = CountingClient({})
+        user.on_start()
+        user.task_1_l()
+        assert user._vars == {"a": 1, "b": 2, "c": 3}
+        assert calls["n"] == 1
+
+
+class TestTagNormalisation:
+    """A string in 'tags' is one tag, not a bag of letters."""
+
+    SCENARIO = {"requests": [
+        {"name": "Buy", "method": "POST", "path": "/buy", "tags": "purchase"},
+        {"name": "Read", "method": "GET", "path": "/read", "tags": ["browse"]},
+    ]}
+
+    def test_string_tag_is_selected_not_dropped(self, tmp_path):
+        content = _generate(tmp_path, self.SCENARIO, {"tags": ["purchase"]})
+        assert "/buy" in content
+        assert "/read" not in content
+
+    def test_string_target_tag_works(self, tmp_path):
+        content = _generate(tmp_path, self.SCENARIO, {"tags": "purchase"})
+        assert "/buy" in content and "/read" not in content
+
+    def test_comma_separated_target_tags(self, tmp_path):
+        content = _generate(tmp_path, self.SCENARIO, {"tags": "purchase,browse"})
+        assert "/buy" in content and "/read" in content
+
+    def test_string_tag_can_be_excluded(self, tmp_path):
+        content = _generate(tmp_path, self.SCENARIO, {"exclude_tags": ["purchase"]})
+        assert "/buy" not in content
+        assert "/read" in content
+
+    def test_letters_of_a_tag_match_nothing(self, tmp_path):
+        # The old set("purchase") behaviour would have matched 'p' here; now
+        # nothing matches, and an empty selection is a loud error.
+        with pytest.raises(ValueError, match="non-empty"):
+            _generate(tmp_path, self.SCENARIO, {"tags": ["p"]})
+
+
+class TestPlaceholdersInDictKeys:
+    """Keys carry placeholders as often as values do."""
+
+    def _call(self, tmp_path, req, payload=None):
+        ns = _exec_generated(tmp_path, {"requests": [req]})
+        user = _make_user(ns, payload)
+        user.on_start()
+        user.task_1_r()
+        return user.client.calls[0]
+
+    def test_query_key_is_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCO_PARAM", "page")
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r",
+            "query": {"${env:LOCO_PARAM}": "1"},
+        })
+        assert call["params"] == {"page": "1"}
+
+    def test_body_key_is_resolved(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "POST", "path": "/r",
+            "json": {"${var:field}": "v"},
+        })
+        # nothing captured 'field' yet, so it resolves to an empty key —
+        # the point is that the placeholder text is not sent verbatim.
+        assert "${var:field}" not in call["json"]
+
+    def test_header_key_is_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCO_HEADER", "X-Tenant")
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r",
+            "headers": {"${env:LOCO_HEADER}": "acme"},
+        })
+        assert call["headers"]["X-Tenant"] == "acme"
+
+    def test_plain_keys_are_untouched(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r", "query": {"page": "1"},
+        })
+        assert call["params"] == {"page": "1"}
+
+
+class TestRequestBodyAndTimeout:
+    """'json' wins over 'data'; a stringy timeout does not reach requests."""
+
+    def _call(self, tmp_path, req):
+        ns = _exec_generated(tmp_path, {"requests": [req]})
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_r()
+        return user.client.calls[0]
+
+    def test_json_wins_over_data(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "POST", "path": "/r",
+            "json": {"a": 1}, "data": {"b": 2},
+        })
+        assert call["json"] == {"a": 1}
+        assert "data" not in call
+
+    def test_data_alone_still_works(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "POST", "path": "/r", "data": {"b": 2},
+        })
+        assert call["data"] == {"b": 2}
+
+    def test_string_timeout_becomes_a_number(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r", "timeout": "5",
+        })
+        assert call["timeout"] == 5.0
+
+    def test_unparseable_timeout_is_dropped(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r", "timeout": "soon",
+        })
+        assert "timeout" not in call
+
+
+class TestThinkTimeBounds:
+    """between(min, max) must receive ordered, non-negative bounds."""
+
+    def test_swapped_bounds_are_ordered(self, tmp_path):
+        content = _generate(tmp_path, {
+            "think_time": {"min": 2.0, "max": 0.5},
+            "requests": [{"name": "R", "method": "GET", "path": "/r"}],
+        })
+        assert "between(0.5, 2.0)" in content
+
+    def test_negative_bounds_are_clamped(self, tmp_path):
+        content = _generate(tmp_path, {
+            "think_time": {"min": -1, "max": 3},
+            "requests": [{"name": "R", "method": "GET", "path": "/r"}],
+        })
+        assert "between(0.0, 3.0)" in content
+
+    def test_ordered_bounds_are_untouched(self, tmp_path):
+        content = _generate(tmp_path, {
+            "think_time": {"min": 0.5, "max": 2.0},
+            "requests": [{"name": "R", "method": "GET", "path": "/r"}],
+        })
+        assert "between(0.5, 2.0)" in content
+
+
 # ── expect: response assertions ───────────────────────────────────────
 
 
@@ -951,6 +1289,29 @@ class TestResponseAssertions:
         resp = self._run(tmp_path, {"json": {"id": "9"}}, payload={"id": 9})
         assert resp.succeeded
 
+    def test_json_missing_path_fails(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"data.status": "ok"}}, payload={})
+        assert resp.failed and "no value at that path" in resp.failure_msg
+
+    def test_json_expected_null_needs_the_path_to_exist(self, tmp_path):
+        # A missing path used to read as None and satisfy `expected: null`.
+        resp = self._run(tmp_path, {"json": {"error": None}}, payload={"ok": 1})
+        assert resp.failed and "no value at that path" in resp.failure_msg
+
+    def test_json_actual_null_matches_expected_null(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"error": None}}, payload={"error": None})
+        assert resp.succeeded
+
+    def test_json_array_index(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"items[0].id": "a"}},
+                         payload={"items": [{"id": "a"}]})
+        assert resp.succeeded
+
+    def test_missing_key_is_not_reported_as_a_decode_failure(self, tmp_path):
+        resp = self._run(tmp_path, {"json": {"x": 1}}, payload={})
+        assert resp.failed
+        assert "not valid JSON" not in resp.failure_msg
+
     def test_max_ms_ok(self, tmp_path):
         resp = self._run(tmp_path, {"max_ms": 500}, elapsed_ms=120)
         assert resp.succeeded
@@ -991,6 +1352,33 @@ class TestResponseAssertions:
         user.task_1_check()
         assert user._vars["cid"] == "xyz"
         assert user.client.responses[-1].succeeded
+
+    # B1: 'expect' must never turn an HTTP or transport error into a pass.
+    def test_expect_without_status_still_fails_on_500(self, tmp_path):
+        resp = self._run(tmp_path, {"max_ms": 5000}, status_code=500, elapsed_ms=10)
+        assert resp.failed and "status 500" in resp.failure_msg
+
+    def test_expect_without_status_still_fails_on_404(self, tmp_path):
+        resp = self._run(tmp_path, {"contains": "x"}, text="x", status_code=404)
+        assert resp.failed and "status 404" in resp.failure_msg
+
+    def test_expect_without_status_fails_on_no_response(self, tmp_path):
+        # status_code 0 is what Locust reports for a connection error.
+        resp = self._run(tmp_path, {"max_ms": 5000}, status_code=0)
+        assert resp.failed and "no response" in resp.failure_msg
+
+    def test_expect_without_status_passes_on_2xx(self, tmp_path):
+        resp = self._run(tmp_path, {"max_ms": 5000}, status_code=204, elapsed_ms=10)
+        assert resp.succeeded
+
+    def test_expect_without_status_passes_on_3xx(self, tmp_path):
+        resp = self._run(tmp_path, {"max_ms": 5000}, status_code=302, elapsed_ms=10)
+        assert resp.succeeded
+
+    def test_explicit_status_still_wins(self, tmp_path):
+        # Asking for 404 on purpose (negative test) must keep passing.
+        resp = self._run(tmp_path, {"status": 404}, status_code=404)
+        assert resp.succeeded
 
     def test_expect_in_flow_step(self, tmp_path):
         scenario = {"flows": [{"name": "F", "steps": [
@@ -1172,6 +1560,200 @@ class TestDataPools:
         assert user.client.calls[-1]["json"]["user"] == "flowuser"
 
 
+class TestLiteralSerialization:
+    """B6: config values must become literals the generated file can evaluate.
+
+    YAML turns `2024-01-01` into a datetime.date and `.inf` into a float whose
+    repr is the bare name `inf`. Both used to be emitted through repr() and
+    made locust fail at import time with NameError / no such module.
+    """
+
+    def _body_scenario(self, body):
+        return {
+            "requests": [
+                {"name": "P", "method": "POST", "path": "/p", "json": body}
+            ]
+        }
+
+    def test_scalars_round_trip(self):
+        for value in ["x", "", "it's", 1, 0, True, False, None, 1.5, -0.25]:
+            assert eval(_literal(value)) == value or value is None
+
+    def test_infinity_and_nan_are_evaluable(self):
+        import math
+
+        assert eval(_literal(float("inf"))) == math.inf
+        assert eval(_literal(float("-inf"))) == -math.inf
+        assert math.isnan(eval(_literal(float("nan"))))
+
+    def test_date_becomes_iso_string(self):
+        import datetime
+
+        assert _literal(datetime.date(2024, 1, 1)) == "'2024-01-01'"
+        assert _literal(datetime.datetime(2024, 1, 1, 10, 30)) == "'2024-01-01T10:30:00'"
+
+    def test_unknown_object_becomes_its_string_form(self):
+        class Weird:
+            def __str__(self):
+                return "weird-value"
+
+        assert _literal(Weird()) == "'weird-value'"
+
+    def test_non_string_keys_become_strings(self):
+        assert _literal({2024: "y"}) == "{'2024': 'y'}"
+
+    def test_nesting_is_recursive(self):
+        import datetime
+
+        rendered = _literal({"a": [1, datetime.date(2024, 1, 1), {"b": float("inf")}]})
+        assert eval(rendered) == {"a": [1, "2024-01-01", {"b": float("inf")}]}
+
+    def test_sets_are_deterministic(self):
+        assert _literal({"b", "a", "c"}) == "['a', 'b', 'c']"
+
+    def test_yaml_date_body_generates_importable_file(self, tmp_path):
+        import datetime
+
+        # _generate compiles the output, which is where the old repr() broke.
+        content = _generate(
+            tmp_path, self._body_scenario({"from": datetime.date(2024, 1, 1)})
+        )
+        assert "'2024-01-01'" in content
+        assert "datetime.date" not in content
+
+    def test_yaml_infinity_body_generates_importable_file(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._body_scenario({"limit": float("inf")}))
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_p()
+        assert user.client.calls[-1]["json"]["limit"] == float("inf")
+
+    def test_numeric_request_name_is_stringified(self, tmp_path):
+        scenario = {"requests": [{"name": 2024, "method": "GET", "path": "/p"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_2024()
+        assert user.client.calls[-1]["name"] == "2024"
+
+    def test_date_in_inline_pool_survives(self, tmp_path):
+        import datetime
+
+        scenario = {
+            "data": {"d": {"inline": [{"day": datetime.date(2024, 1, 1)}],
+                           "mode": "once"}},
+            "requests": [{"name": "P", "method": "GET", "path": "/p/${data:d.day}"}],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_p()
+        assert user.client.calls[-1]["url"] == "/p/2024-01-01"
+
+
+class TestRequestRowScope:
+    """B2: every ${data:} in one request comes from the same pool row.
+
+    Before this, `random` and `round_robin` re-picked a row per placeholder,
+    so a login body could carry the username of one account and the password
+    of another — every such request failed against a real service.
+    """
+
+    ROWS = [
+        {"login": "u1", "password": "p1"},
+        {"login": "u2", "password": "p2"},
+        {"login": "u3", "password": "p3"},
+    ]
+
+    def _scenario(self, mode, **req_extra):
+        req = {
+            "name": "Login",
+            "method": "POST",
+            "path": "/login",
+            "json": {
+                "user": "${data:accounts.login}",
+                "pass": "${data:accounts.password}",
+            },
+        }
+        req.update(req_extra)
+        return {
+            "data": {"accounts": {"inline": self.ROWS, "mode": mode}},
+            "requests": [req],
+        }
+
+    @pytest.mark.parametrize("mode", ["random", "round_robin"])
+    def test_login_and_password_come_from_one_row(self, tmp_path, mode):
+        ns = _exec_generated(tmp_path, self._scenario(mode))
+        user = _make_user(ns)
+        user.on_start()
+        for _ in range(12):
+            user.task_1_login()
+            body = user.client.calls[-1]["json"]
+            assert {"login": body["user"], "password": body["pass"]} in self.ROWS
+
+    def test_round_robin_advances_once_per_request(self, tmp_path):
+        # Two placeholders per request must consume one row, not two.
+        ns = _exec_generated(tmp_path, self._scenario("round_robin"))
+        user = _make_user(ns)
+        user.on_start()
+        seen = []
+        for _ in range(4):
+            user.task_1_login()
+            seen.append(user.client.calls[-1]["json"]["user"])
+        assert seen == ["u1", "u2", "u3", "u1"]
+
+    def test_expect_sees_the_row_that_was_sent(self, tmp_path):
+        scenario = self._scenario(
+            "round_robin", expect={"contains": "${data:accounts.login}"}
+        )
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns, payload={"echo": "u1"})
+        user.on_start()
+        user.task_1_login()
+        sent = user.client.calls[-1]["json"]["user"]
+        resp = user.client.responses[-1]
+        # The body echoes u1; the assertion must be checked against the same
+        # row the request used, so it passes only for the first row.
+        assert (sent == "u1") == resp.succeeded
+
+    def test_scope_is_reset_between_flow_steps(self, tmp_path):
+        scenario = {
+            "data": {"accounts": {"inline": self.ROWS, "mode": "round_robin"}},
+            "flows": [
+                {"name": "F", "steps": [
+                    {"name": "A", "method": "POST", "path": "/a",
+                     "json": {"user": "${data:accounts.login}",
+                              "pass": "${data:accounts.password}"}},
+                    {"name": "B", "method": "POST", "path": "/b",
+                     "json": {"user": "${data:accounts.login}"}},
+                ]}
+            ],
+        }
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns)
+        user.on_start()
+        flow = _make_flow(ns, "Flow_1_f", user)
+        flow.step_1_a()
+        flow.step_2_b()
+        assert user.client.calls[0]["json"] == {"user": "u1", "pass": "p1"}
+        assert user.client.calls[1]["json"] == {"user": "u2"}
+
+    def test_pinned_modes_generate_no_scope_reset(self, tmp_path):
+        # unique_per_user / once pin one row per user, so the generated file
+        # stays exactly as it was before this change.
+        for mode in ("unique_per_user", "once"):
+            content = _generate(tmp_path, self._scenario(mode))
+            assert "_begin_request()" not in content
+
+    def test_pinned_row_survives_across_requests(self, tmp_path):
+        ns = _exec_generated(tmp_path, self._scenario("unique_per_user"))
+        user = _make_user(ns)
+        user.on_start()
+        user.task_1_login()
+        user.task_1_login()
+        assert user.client.calls[0]["json"] == user.client.calls[1]["json"]
+
+
 class TestDataPoolValidation:
     def _gen(self, data):
         return ScenarioGenerator(
@@ -1240,12 +1822,25 @@ def _exec_users(tmp_path, users, target=None):
         def interrupt(self, reschedule=True):
             self.interrupted = True
 
+    class FakeEventHook:
+        def __init__(self):
+            self.listeners = []
+
+        def add_listener(self, func):
+            self.listeners.append(func)
+            return func
+
+        def fire(self, **kwargs):
+            for listener in self.listeners:
+                listener(**kwargs)
+
     fake = _t.ModuleType("locust")
     fake.HttpUser = type("HttpUser", (), {})
     fake.SequentialTaskSet = FakeSequentialTaskSet
     fake.task = fake_task
     fake.tag = lambda *tags: (lambda f: f)
     fake.between = lambda a, b: (a, b)
+    fake.events = _t.SimpleNamespace(init=FakeEventHook())
 
     saved = sys.modules.get("locust")
     sys.modules["locust"] = fake
@@ -1257,6 +1852,7 @@ def _exec_users(tmp_path, users, target=None):
             sys.modules["locust"] = saved
         else:
             sys.modules.pop("locust", None)
+    namespace["_fake_locust"] = fake
     return namespace
 
 
@@ -1590,3 +2186,388 @@ class TestGeneratedPoolValidation:
         gen = self._gen({"p": {"generate": "nope"}})
         with pytest.raises(ValueError, match="generate must be an object"):
             gen.generate(tmp_path)
+
+
+class TestTypedJsonBodies:
+    """A JSON body is the one place where "7" and 7 are different things."""
+
+    def _call(self, tmp_path, req, scenario_extra=None, payload=None):
+        scenario = {"requests": [req]}
+        if scenario_extra:
+            scenario.update(scenario_extra)
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns, payload)
+        user.on_start()
+        user.task_1_r()
+        return user.client.calls[0]
+
+    def _body(self, tmp_path, body, **kw):
+        return self._call(tmp_path, {
+            "name": "R", "method": "POST", "path": "/r", "json": body,
+        }, **kw)["json"]
+
+    def test_randint_is_an_int(self, tmp_path):
+        body = self._body(tmp_path, {"quantity": "${randint:7:7}"})
+        assert body["quantity"] == 7
+        assert isinstance(body["quantity"], int)
+
+    def test_iteration_is_an_int(self, tmp_path):
+        body = self._body(tmp_path, {"n": "${iteration}"})
+        assert isinstance(body["n"], int)
+
+    def test_timestamp_is_an_int(self, tmp_path):
+        body = self._body(tmp_path, {"ts": "${timestamp}"})
+        assert isinstance(body["ts"], int)
+
+    def test_fake_bool_is_a_bool(self, tmp_path):
+        body = self._body(tmp_path, {"flag": "${fake:bool}"})
+        assert body["flag"] in (True, False)
+        assert isinstance(body["flag"], bool)
+
+    def test_uuid_stays_a_string(self, tmp_path):
+        body = self._body(tmp_path, {"id": "${uuid}"})
+        assert isinstance(body["id"], str)
+
+    def test_digits_from_fake_stay_a_string(self, tmp_path):
+        # A code that happens to be all digits is still a code.
+        body = self._body(tmp_path, {"code": "${random:6}"})
+        assert isinstance(body["code"], str)
+
+    def test_placeholder_mixed_with_text_stays_a_string(self, tmp_path):
+        body = self._body(tmp_path, {"sku": "SKU-${randint:3:3}"})
+        assert body["sku"] == "SKU-3"
+
+    def test_captured_number_stays_a_number(self, tmp_path):
+        scenario = {"requests": [
+            {"name": "First", "method": "GET", "path": "/first",
+             "capture": {"order_id": "id"}},
+            {"name": "R", "method": "POST", "path": "/r",
+             "json": {"order": "${var:order_id}"}},
+        ]}
+        ns = _exec_generated(tmp_path, scenario)
+        user = _make_user(ns, {"id": 42})
+        user.on_start()
+        user.task_1_first()
+        user.task_2_r()
+        assert user.client.calls[1]["json"]["order"] == 42
+
+    def test_uncaptured_var_is_an_empty_string_not_null(self, tmp_path):
+        body = self._body(tmp_path, {"order": "${var:nope}"})
+        assert body["order"] == ""
+
+    def test_pool_value_keeps_its_loaded_type(self, tmp_path):
+        call = self._call(
+            tmp_path,
+            {"name": "R", "method": "POST", "path": "/r",
+             "json": {"qty": "${data:items.qty}"}},
+            scenario_extra={"data": {"items": {
+                "inline": [{"qty": 3}], "mode": "once"}}},
+        )
+        assert call["json"]["qty"] == 3
+
+    def test_nested_structures_are_resolved(self, tmp_path):
+        body = self._body(tmp_path, {
+            "lines": [{"qty": "${randint:2:2}"}],
+            "meta": {"n": "${randint:9:9}"},
+        })
+        assert body["lines"][0]["qty"] == 2
+        assert body["meta"]["n"] == 9
+
+    def test_non_string_literals_survive(self, tmp_path):
+        body = self._body(tmp_path, {"a": 1, "b": None, "c": True, "d": 1.5})
+        assert body == {"a": 1, "b": None, "c": True, "d": 1.5}
+
+    def test_keys_are_still_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCO_FIELD", "quantity")
+        body = self._body(tmp_path, {"${env:LOCO_FIELD}": "${randint:4:4}"})
+        assert body == {"quantity": 4}
+
+    def test_headers_still_stringify(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r",
+            "headers": {"X-N": "${randint:5:5}"},
+        })
+        assert call["headers"]["X-N"] == "5"
+
+    def test_query_still_stringifies(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "GET", "path": "/r",
+            "query": {"n": "${randint:5:5}"},
+        })
+        assert call["params"]["n"] == "5"
+
+    def test_form_body_still_stringifies(self, tmp_path):
+        call = self._call(tmp_path, {
+            "name": "R", "method": "POST", "path": "/r",
+            "data": {"n": "${randint:5:5}"},
+        })
+        assert call["data"]["n"] == "5"
+
+
+# ── distributed runs: one slice of each pool per worker ────────────────
+
+
+def _shard_namespace(tmp_path, scenario, worker_index, expect_workers, target=None):
+    """Exec a generated locustfile as worker `worker_index` of `expect_workers`."""
+    ns = _exec_generated(tmp_path, scenario, target)
+    runner = types.SimpleNamespace(worker_index=worker_index)
+    environment = types.SimpleNamespace(
+        runner=runner,
+        parsed_options=types.SimpleNamespace(expect_workers=expect_workers),
+    )
+    # The generated file registers its listener on the fake hook at import.
+    ns["_fake_locust"].events.init.fire(environment=environment, runner=runner)
+    return ns
+
+
+def _accounts_csv(tmp_path, count):
+    path = tmp_path / "accounts.csv"
+    rows = "\n".join(f"user{i},pw{i}" for i in range(count))
+    path.write_text(f"login,password\n{rows}\n", encoding="utf-8")
+    return str(path)
+
+
+def _pool_scenario(source, mode="unique_per_user"):
+    return {
+        "data": {"acc": {"source": source, "mode": mode}},
+        "requests": [
+            {"name": "Login", "method": "POST", "path": "/login",
+             "json": {"login": "${data:acc.login}"}},
+        ],
+    }
+
+
+class TestPoolSharding:
+    def _rows(self, tmp_path, source, index, count, mode="unique_per_user"):
+        ns = _shard_namespace(tmp_path, _pool_scenario(source, mode), index, count)
+        return ns["_load_pool"]("acc")
+
+    def test_one_process_sees_the_whole_pool(self, tmp_path):
+        source = _accounts_csv(tmp_path, 10)
+        rows = self._rows(tmp_path, source, 0, 1)
+        assert [r["login"] for r in rows] == [f"user{i}" for i in range(10)]
+
+    def test_workers_get_disjoint_slices(self, tmp_path):
+        source = _accounts_csv(tmp_path, 12)
+        slices = [
+            [r["login"] for r in self._rows(tmp_path, source, i, 4)]
+            for i in range(4)
+        ]
+        seen = [login for s in slices for login in s]
+        assert len(seen) == len(set(seen)) == 12
+
+    def test_slices_reassemble_into_the_whole_pool(self, tmp_path):
+        source = _accounts_csv(tmp_path, 12)
+        seen = set()
+        for i in range(4):
+            seen.update(r["login"] for r in self._rows(tmp_path, source, i, 4))
+        assert seen == {f"user{i}" for i in range(12)}
+
+    def test_slices_are_balanced_within_one_row(self, tmp_path):
+        # A stride, not a contiguous block: 10 rows over 4 workers is
+        # 3/3/2/2, never 3/3/3/1.
+        source = _accounts_csv(tmp_path, 10)
+        sizes = [len(self._rows(tmp_path, source, i, 4)) for i in range(4)]
+        assert sorted(sizes) == [2, 2, 3, 3]
+
+    def test_round_robin_is_sharded_too(self, tmp_path):
+        source = _accounts_csv(tmp_path, 8)
+        a = [r["login"] for r in self._rows(tmp_path, source, 0, 2, mode="round_robin")]
+        b = [r["login"] for r in self._rows(tmp_path, source, 1, 2, mode="round_robin")]
+        assert set(a).isdisjoint(b)
+        assert len(a) + len(b) == 8
+
+    def test_random_is_left_whole(self, tmp_path):
+        # Splitting 'random' would only narrow what each worker can draw
+        # from; it was never wrong to begin with.
+        source = _accounts_csv(tmp_path, 8)
+        assert len(self._rows(tmp_path, source, 1, 4, mode="random")) == 8
+
+    def test_once_still_means_the_first_row(self, tmp_path):
+        # 'once' has to see rows[0], or on worker 1 it silently means
+        # "the second row" instead.
+        source = _accounts_csv(tmp_path, 8)
+        for index in range(4):
+            rows = self._rows(tmp_path, source, index, 4, mode="once")
+            assert rows[0]["login"] == "user0"
+
+    def test_more_workers_than_rows_falls_back_to_the_whole_pool(self, tmp_path):
+        # An empty shard means the worker generates no load at all, which is
+        # a far worse failure than repeating rows — and it warns.
+        source = _accounts_csv(tmp_path, 3)
+        rows = self._rows(tmp_path, source, 7, 8)
+        assert len(rows) == 3
+
+    def test_inline_pools_are_sharded(self, tmp_path):
+        scenario = {
+            "data": {"acc": {"inline": [{"login": f"u{i}"} for i in range(6)],
+                             "mode": "unique_per_user"}},
+            "requests": [{"name": "L", "method": "POST", "path": "/l",
+                          "json": {"login": "${data:acc.login}"}}],
+        }
+        ns = _shard_namespace(tmp_path, scenario, 1, 3)
+        assert [r["login"] for r in ns["_load_pool"]("acc")] == ["u1", "u4"]
+
+    def test_generated_pools_are_not_sharded(self, tmp_path):
+        # Synthesised rows are drawn independently in every process, so there
+        # is no shared sequence to divide — slicing would just discard rows.
+        scenario = {
+            "data": {"acc": {"generate": {"count": 12, "fields": {"u": "${fake:username}"}},
+                             "mode": "unique_per_user"}},
+            "requests": [{"name": "L", "method": "POST", "path": "/l",
+                          "json": {"login": "${data:acc.u}"}}],
+        }
+        ns = _shard_namespace(tmp_path, scenario, 1, 4)
+        assert len(ns["_load_pool"]("acc")) == 12
+
+    def test_users_on_different_workers_do_not_share_a_row(self, tmp_path):
+        # The whole point, stated end to end: eight users spread over two
+        # workers get eight different logins.
+        source = _accounts_csv(tmp_path, 8)
+        logins = []
+        for index in range(2):
+            ns = _shard_namespace(tmp_path, _pool_scenario(source), index, 2)
+            for _ in range(4):
+                user = _make_user(ns)
+                user.on_start()
+                logins.append(user._data_rows["acc"]["login"])
+        assert sorted(logins) == sorted(f"user{i}" for i in range(8))
+
+
+class TestShardResolution:
+    def _ns(self, tmp_path, **environment_kwargs):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        if environment_kwargs:
+            ns["_fake_locust"].events.init.fire(**environment_kwargs)
+        return ns
+
+    def test_without_a_runner_it_answers_one_process(self, tmp_path):
+        ns = self._ns(tmp_path)
+        assert ns["_shard"]() == {"id": 0, "count": 1, "resolved": False}
+
+    def test_an_unresolved_answer_is_not_cached(self, tmp_path):
+        # Answering "one process" before locust has a runner must not stop
+        # the real answer from being picked up.
+        ns = self._ns(tmp_path)
+        ns["_shard"]()
+        runner = types.SimpleNamespace(worker_index=2)
+        ns["_fake_locust"].events.init.fire(
+            environment=types.SimpleNamespace(
+                runner=runner,
+                parsed_options=types.SimpleNamespace(expect_workers=5),
+            ),
+        )
+        assert ns["_shard"]()["id"] == 2
+        assert ns["_shard"]()["count"] == 5
+
+    def test_an_old_master_declines_to_shard(self, tmp_path):
+        # worker_index is -1 on masters <= 2.10.2. Guessing an index would
+        # hand the same rows to several workers — the exact bug this exists
+        # to prevent.
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        runner = types.SimpleNamespace(worker_index=-1)
+        ns["_fake_locust"].events.init.fire(
+            environment=types.SimpleNamespace(
+                runner=runner,
+                parsed_options=types.SimpleNamespace(expect_workers=4),
+            ),
+        )
+        assert ns["_shard"]() == {"id": 0, "count": 1, "resolved": True}
+
+    def test_a_missing_worker_count_means_one_process(self, tmp_path):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        ns["_fake_locust"].events.init.fire(
+            environment=types.SimpleNamespace(
+                runner=types.SimpleNamespace(worker_index=0),
+                parsed_options=None,
+            ),
+        )
+        assert ns["_shard"]()["count"] == 1
+
+    def test_an_index_beyond_the_count_wraps(self, tmp_path):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _exec_generated(tmp_path, scenario)
+        ns["_fake_locust"].events.init.fire(
+            environment=types.SimpleNamespace(
+                runner=types.SimpleNamespace(worker_index=5),
+                parsed_options=types.SimpleNamespace(expect_workers=4),
+            ),
+        )
+        assert ns["_shard"]()["id"] == 1
+
+
+class TestShardDataDisabled:
+    """load.shard_data: false — every process keeps the whole pool."""
+
+    def _rows(self, tmp_path, source, index, count, mode="unique_per_user"):
+        ns = _shard_namespace(
+            tmp_path, _pool_scenario(source, mode), index, count,
+            target={"shard_data": False},
+        )
+        return ns["_load_pool"]("acc")
+
+    def test_the_flag_reaches_the_generated_file(self, tmp_path):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        content = _generate(tmp_path, scenario, {"shard_data": False})
+        assert "_SHARD_DATA = False" in content
+
+    def test_it_defaults_to_on(self, tmp_path):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        assert "_SHARD_DATA = True" in _generate(tmp_path, scenario)
+
+    def test_every_worker_keeps_the_whole_pool(self, tmp_path):
+        source = _accounts_csv(tmp_path, 8)
+        for index in range(4):
+            rows = self._rows(tmp_path, source, index, 4)
+            assert [r["login"] for r in rows] == [f"user{i}" for i in range(8)]
+
+    def test_workers_then_collide_on_purpose(self, tmp_path):
+        # The stated intent of the flag: two workers hand the same row to
+        # different users. Sharding exists to prevent exactly this, which is
+        # why it is the default.
+        source = _accounts_csv(tmp_path, 4)
+        logins = []
+        for index in range(2):
+            ns = _shard_namespace(
+                tmp_path, _pool_scenario(source), index, 2,
+                target={"shard_data": False},
+            )
+            user = _make_user(ns)
+            user.on_start()
+            logins.append(user._data_rows["acc"]["login"])
+        assert logins[0] == logins[1]
+
+    def test_iteration_is_still_seeded_per_worker(self, tmp_path):
+        # shard_data only turns off pool slicing. The shard itself is still
+        # resolved, so ${iteration} keeps producing ids that do not collide.
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _shard_namespace(
+            tmp_path, scenario, 1, 4, target={"shard_data": False},
+        )
+        assert ns["_iteration"]() == 1000000001
+
+
+class TestIterationAcrossWorkers:
+    def _iterations(self, tmp_path, index, count, n=3):
+        scenario = {"requests": [{"name": "H", "method": "GET", "path": "/h"}]}
+        ns = _shard_namespace(tmp_path, scenario, index, count)
+        return [ns["_iteration"]() for _ in range(n)]
+
+    def test_one_process_starts_at_one(self, tmp_path):
+        assert self._iterations(tmp_path, 0, 1) == [1, 2, 3]
+
+    def test_workers_do_not_overlap(self, tmp_path):
+        # Four workers each emitting 1, 2, 3 turns ${iteration} into four
+        # copies of the same order numbers.
+        first = self._iterations(tmp_path, 0, 4)
+        second = self._iterations(tmp_path, 1, 4)
+        assert set(first).isdisjoint(second)
+        assert second[0] == 1000000001
+
+    def test_the_seed_is_taken_once(self, tmp_path):
+        assert self._iterations(tmp_path, 2, 4, n=3) == [
+            2000000001, 2000000002, 2000000003,
+        ]

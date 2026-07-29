@@ -26,7 +26,10 @@ classifiers = [
 ]
 dependencies = [
   "PyYAML>=6.0",
-  "locust>=2.0",
+  # 2.11 is where a worker first learns its own index (MasterRunner sends it
+  # in the ack). Older masters report -1, and without an index there is no
+  # way to give each worker a different slice of a data pool.
+  "locust>=2.11",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +45,9 @@ loco = "locomotive.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "e2e: runs real locust against a real HTTP server (slow; skipped without the locust binary)",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

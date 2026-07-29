@@ -65,14 +65,14 @@ class TestEvaluateThreshold:
         result = _evaluate_threshold("rps", 40.0, {"fail": 50.0, "direction": "decrease"}, "resilience", True, None)
         assert result["status"] == "DEGRADATION"
 
-    def test_not_eligible_skips(self):
+    def test_not_eligible_is_no_data(self):
         result = _evaluate_threshold("error_rate", 10.0, {"fail": 5.0}, "resilience", False, "min_requests not met")
-        assert result["status"] == "SKIP"
+        assert result["status"] == "NO_DATA"
         assert "min_requests" in result["reason"]
 
     def test_missing_current_value(self):
         result = _evaluate_threshold("error_rate", None, {"fail": 5.0}, "resilience", True, None)
-        assert result["status"] == "SKIP"
+        assert result["status"] == "NO_DATA"
 
     def test_missing_thresholds(self):
         result = _evaluate_threshold("error_rate", 3.0, {}, "resilience", True, None)
@@ -103,8 +103,9 @@ class TestSummarizeHistory:
             {"timestamp": 15.0, "rps": 200.0, "failures_s": 2.0},  # counted
         ]
         result = summarize_history(history, 10)
-        assert result["requests"] == pytest.approx(400.0)
-        assert result["failures"] == pytest.approx(4.0)
+        # Two rows, five seconds each: 200 rps * 5s, twice.
+        assert result["requests"] == pytest.approx(2000.0)
+        assert result["failures"] == pytest.approx(20.0)
 
     def test_zero_requests(self):
         history = [
@@ -112,6 +113,79 @@ class TestSummarizeHistory:
         ]
         result = summarize_history(history, 0)
         assert result["error_rate"] is None
+
+
+class TestHistoryIntervals:
+    """``rps`` is a rate; a row is only worth as many requests as it is long."""
+
+    def test_one_second_rows_are_unchanged(self):
+        history = [{"timestamp": float(i), "rps": 10.0, "failures_s": 1.0} for i in range(5)]
+        result = summarize_history(history, 0)
+        assert result["requests"] == pytest.approx(50.0)
+        assert result["failures"] == pytest.approx(5.0)
+
+    def test_ten_second_rows_count_ten_seconds_each(self):
+        history = [{"timestamp": float(i * 10), "rps": 10.0, "failures_s": 0.0} for i in range(5)]
+        result = summarize_history(history, 0)
+        # The same run, recorded at a coarser interval, made the same requests.
+        assert result["requests"] == pytest.approx(500.0)
+
+    def test_error_rate_is_unaffected_by_the_interval(self):
+        fine = [{"timestamp": float(i), "rps": 10.0, "failures_s": 1.0} for i in range(10)]
+        coarse = [{"timestamp": float(i * 5), "rps": 10.0, "failures_s": 1.0} for i in range(10)]
+        assert summarize_history(fine, 0)["error_rate"] == pytest.approx(
+            summarize_history(coarse, 0)["error_rate"]
+        )
+
+    def test_missing_timestamps_fall_back_to_one_row_per_second(self):
+        history = [{"rps": 10.0, "failures_s": 0.0} for _ in range(4)]
+        result = summarize_history(history, 0)
+        assert result["requests"] == pytest.approx(40.0)
+
+    def test_a_single_row_covers_one_second(self):
+        result = summarize_history([{"timestamp": 1000.0, "rps": 7.0, "failures_s": 0.0}], 0)
+        assert result["requests"] == pytest.approx(7.0)
+
+    def test_a_hole_in_the_history_does_not_invent_requests(self):
+        history = [
+            {"timestamp": 0.0, "rps": 10.0, "failures_s": 0.0},
+            {"timestamp": 1.0, "rps": 10.0, "failures_s": 0.0},
+            {"timestamp": 2.0, "rps": 10.0, "failures_s": 0.0},
+            # locust went quiet for five minutes; the next sample describes
+            # its own second, not the silence before it.
+            {"timestamp": 302.0, "rps": 10.0, "failures_s": 0.0},
+        ]
+        result = summarize_history(history, 0)
+        assert result["requests"] == pytest.approx(40.0)
+
+    def test_duplicate_timestamps_do_not_zero_a_row(self):
+        history = [
+            {"timestamp": 0.0, "rps": 10.0, "failures_s": 0.0},
+            {"timestamp": 0.0, "rps": 10.0, "failures_s": 0.0},
+            {"timestamp": 1.0, "rps": 10.0, "failures_s": 0.0},
+        ]
+        result = summarize_history(history, 0)
+        assert result["requests"] == pytest.approx(30.0)
+
+    def test_string_timestamps_are_read_as_numbers(self):
+        history = [{"timestamp": str(i * 5), "rps": 10.0, "failures_s": 0.0} for i in range(3)]
+        result = summarize_history(history, 5)
+        # The first row is warmup; the other two are five seconds each.
+        assert result["requests"] == pytest.approx(100.0)
+
+    def test_min_requests_gate_sees_the_real_count(self):
+        history = [{"timestamp": float(i * 5), "rps": 20.0, "failures_s": 0.0} for i in range(12)]
+        summary = summarize_history(history, 10)
+        result = evaluate_gate(
+            {"error_rate": 0.0, "requests": 1200},
+            {"thresholds": {"error_rate": {"fail": 5}}, "min_requests": 500, "warmup_seconds": 10},
+            "resilience",
+            summary,
+        )
+        # Ten counted rows at 20 rps over five seconds each is 1000 requests —
+        # the old per-row sum said 200 and the gate reported NO_DATA.
+        assert result["gate"]["requests_used"] == 1000
+        assert result["results"][0]["status"] == "PASS"
 
 
 # ── evaluate_gate ─────────────────────────────────────────────────────
@@ -138,7 +212,24 @@ class TestEvaluateGate:
         metrics = {"error_rate": 10.0, "requests": 50}
         result = evaluate_gate(metrics, cfg, "resilience")
         statuses = [r["status"] for r in result["results"]]
-        assert all(s == "SKIP" for s in statuses)
+        # A gate that could not be evaluated is not a gate that passed.
+        assert all(s == "NO_DATA" for s in statuses)
+        assert result["status"] == "NO_DATA"
+
+    def test_zero_requests_is_no_data(self):
+        cfg = {"thresholds": {"p95": {"fail": 500}}}
+        metrics = {"p95": 0.0, "requests": 0}
+        result = evaluate_gate(metrics, cfg, "resilience")
+        assert result["status"] == "NO_DATA"
+        assert "0 requests" in result["results"][0]["reason"]
+
+    def test_min_requests_defaults_to_one(self):
+        cfg = {"thresholds": {"p95": {"fail": 500}}}
+        metrics = {"p95": 120.0, "requests": 1}
+        result = evaluate_gate(metrics, cfg, "resilience")
+        assert result["gate"]["min_requests"] is None
+        assert result["gate"]["min_requests_effective"] == 1
+        assert result["status"] == "PASS"
 
     def test_warmup_recalculates_metrics(self):
         cfg = {"thresholds": {"error_rate": {"fail": 5}}, "warmup_seconds": 10}

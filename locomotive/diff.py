@@ -47,7 +47,13 @@ def _config_operations(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     ops: List[Dict[str, Any]] = []
     for scope, scenario in iter_scenarios(config):
         for loc, req in iter_requests(scenario, scope):
-            body = req.get("json") if isinstance(req.get("json"), dict) else {}
+            # A form-encoded request carries its fields in ``data`` — the spec
+            # calls both a requestBody, so both are body fields here. Reading
+            # only ``json`` made every form endpoint (an OAuth2 /token, say)
+            # look like it was missing every field the spec requires.
+            body = req.get("json")
+            if not isinstance(body, dict):
+                body = req.get("data") if isinstance(req.get("data"), dict) else {}
             query = req.get("query") if isinstance(req.get("query"), dict) else {}
             ops.append({
                 "location": loc,
@@ -73,17 +79,28 @@ def diff_config_spec(config: Dict[str, Any], spec: Dict[str, Any]) -> List[Findi
     spec_by_id = {o["operation_id"]: o for o in spec_ops if o["operation_id"]}
     spec_by_mp: Dict[tuple, Dict[str, Any]] = {}
     for o in spec_ops:
+        # Both forms are registered: the spec's server prefix (``/v1``) may
+        # live in the config's request paths or in ``load.host``, and neither
+        # choice is drift.
         spec_by_mp.setdefault((o["method"], o["canonical"]), o)
+        spec_by_mp.setdefault((o["method"], o.get("canonical_bare") or o["canonical"]), o)
 
     matched: set = set()
     findings: List[Finding] = []
 
     for c in cfg_ops:
         match = None
+        stale_id = ""
         if c["operation_id"] and c["operation_id"] in spec_by_id:
             match = spec_by_id[c["operation_id"]]
         else:
             match = spec_by_mp.get((c["method"], c["canonical"]))
+            if c["operation_id"] and match is not None:
+                # The path still resolves, so this is not a dead route — but
+                # the operationId the config was generated against is gone.
+                # Falling through silently is how a renamed operation stays
+                # invisible until the next regeneration overwrites the edits.
+                stale_id = c["operation_id"]
 
         if match is None:
             findings.append(Finding(
@@ -93,6 +110,15 @@ def diff_config_spec(config: Dict[str, Any], spec: Dict[str, Any]) -> List[Findi
             continue
 
         matched.add(id(match))
+
+        if stale_id:
+            new_id = match["operation_id"]
+            became = f"renamed to '{new_id}'" if new_id else "no longer has an operationId"
+            findings.append(Finding(
+                CHANGED, INFO, c["location"],
+                f"{_op_label(match)}: _operation '{stale_id}' is not in the spec "
+                f"(matched by path; the operation {became})",
+            ))
 
         missing = match["required_body"] - c["body_fields"]
         if missing:

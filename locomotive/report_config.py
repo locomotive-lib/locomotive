@@ -2,8 +2,39 @@
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Colours
+#
+# Theme colours are the one part of the config that the report writes into a
+# stylesheet rather than into the document body, and a ``<style>`` block has
+# no entity syntax — ``html.escape`` does nothing there. So the answer is to
+# recognise a colour rather than to escape one: a value that needs a ";", a
+# ":" or a brace is not a colour, and both the renderer (which drops it) and
+# ``loco validate`` (which says so) ask the same two questions here.
+# ---------------------------------------------------------------------------
+
+# Enough for "#3b82f6", "rgba(0,0,0,.5)", "1px solid red" and "var(--primary)",
+# and short of ";", ":", "{", "}", quotes and slashes — the characters needed
+# to close a declaration, open a url() or start a comment.
+_CSS_VALUE_RE = re.compile(r"^[A-Za-z0-9 #%(),.\-_+]{1,64}$")
+_CSS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def css_name(name: Any) -> Optional[str]:
+    """A custom-property name safe to write into a stylesheet, or ``None``."""
+    text = str(name)
+    return text if _CSS_NAME_RE.match(text) else None
+
+
+def css_value(value: Any) -> Optional[str]:
+    """A declaration value safe to write into a stylesheet, or ``None``."""
+    text = str(value).strip()
+    return text if _CSS_VALUE_RE.match(text) else None
 
 
 # ---------------------------------------------------------------------------

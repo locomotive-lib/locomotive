@@ -89,10 +89,11 @@ class TestEvaluateRule:
         result = evaluate_rule(rule_relative_increase, current, baseline_metrics)
         assert result["status"] == "DEGRADATION"
 
-    def test_relative_skip_missing_current(self, rule_relative_increase, baseline_metrics):
+    def test_missing_current_is_no_data(self, rule_relative_increase, baseline_metrics):
         current = {"rps": 100}  # no p95_ms
         result = evaluate_rule(rule_relative_increase, current, baseline_metrics)
-        assert result["status"] == "SKIP"
+        # The metric was never measured, so the rule was never checked.
+        assert result["status"] == "NO_DATA"
 
     def test_relative_skip_missing_baseline(self, rule_relative_increase):
         current = {"p95_ms": 250}
@@ -164,12 +165,30 @@ class TestAnalyze:
         result = analyze(current, {}, rules)
         assert result["summary"]["PASS"] == 1
         assert result["summary"]["WARNING"] == 1
-        assert result["summary"]["SKIP"] == 1
+        assert result["summary"]["NO_DATA"] == 1
 
     def test_skip_does_not_escalate(self):
-        rules = [Rule("missing", "relative", "increase", 10, 20)]
-        result = analyze({}, {}, rules)
+        # A missing baseline is a legitimate SKIP: nothing to compare against yet.
+        rules = [Rule("p95_ms", "relative", "increase", 10, 20)]
+        result = analyze({"p95_ms": 250.0}, {}, rules)
+        assert result["results"][0]["status"] == "SKIP"
         assert result["status"] == "PASS"
+
+    def test_no_data_escalates_over_warning(self):
+        rules = [
+            Rule("error_rate", "absolute", "increase", 1, 5),
+            Rule("missing", "absolute", "increase", 1, 5),
+        ]
+        result = analyze({"error_rate": 2.0}, {}, rules)
+        assert result["status"] == "NO_DATA"
+
+    def test_degradation_still_beats_no_data(self):
+        rules = [
+            Rule("error_rate", "absolute", "increase", 1, 5),
+            Rule("missing", "absolute", "increase", 1, 5),
+        ]
+        result = analyze({"error_rate": 50.0}, {}, rules)
+        assert result["status"] == "DEGRADATION"
 
 
 # ── merge_results ──────────────────────────────────────────────────────
@@ -193,3 +212,51 @@ class TestMergeResults:
         set2 = [{"status": "DEGRADATION"}]
         result = merge_results([set1, set2])
         assert result["status"] == "DEGRADATION"
+
+
+# ── topology drift ────────────────────────────────────────────────────
+
+
+class TestTopologyResults:
+    def _meta(self, generators):
+        return {"topology": {"role": "master", "load_generators": generators}}
+
+    def test_the_same_topology_says_nothing(self):
+        from locomotive.analyzer import topology_results
+
+        assert topology_results(self._meta(4), self._meta(4)) == []
+
+    def test_a_changed_generator_count_warns(self):
+        # Eight processes against a one-process baseline reports a glorious
+        # RPS win and a p95 regression, and neither is about the code.
+        from locomotive.analyzer import topology_results
+
+        results = topology_results(self._meta(8), self._meta(1))
+        assert len(results) == 1
+        assert results[0]["status"] == "WARNING"
+        assert results[0]["current"] == 8 and results[0]["baseline"] == 1
+
+    def test_it_warns_rather_than_fails(self):
+        # Re-baselining after deliberately scaling up is the right move, and
+        # the run that does it has to be allowed to happen.
+        from locomotive.analyzer import topology_results
+
+        assert topology_results(self._meta(8), self._meta(1))[0]["status"] != "FAIL"
+
+    @pytest.mark.parametrize("current,baseline", [
+        ({}, {"topology": {"load_generators": 4}}),
+        ({"topology": {"load_generators": 4}}, {}),
+        ({}, {}),
+        (None, None),
+    ])
+    def test_an_unknown_topology_is_not_a_difference(self, current, baseline):
+        # Runs recorded before run.json carried a topology simply do not
+        # have one; that has to read as "unknown", not as a change.
+        from locomotive.analyzer import topology_results
+
+        assert topology_results(current, baseline) == []
+
+    def test_a_nonsense_count_is_ignored(self):
+        from locomotive.analyzer import topology_results
+
+        assert topology_results({"topology": {"load_generators": "many"}}, self._meta(1)) == []

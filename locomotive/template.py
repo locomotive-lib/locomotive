@@ -10,10 +10,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .openapi import base_url as _base_url
 from .openapi import convert_path_params as _convert_path_params
 from .openapi import extract_requests as _extract_requests
 from .openapi import load_spec as _load_openapi
 from .openapi import scaffold_scenario as _scaffold_scenario
+
+DEFAULT_HOST = "http://localhost:8000"
 
 
 def _extract_endpoints(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -76,28 +79,33 @@ def _flows_example() -> List[Dict[str, Any]]:
 
 def generate_template(
     output_path: Path,
-    host: str = "http://localhost:8000",
+    host: Optional[str] = None,
     openapi_path: Optional[Path] = None,
 ) -> None:
     """Generate a Locomotive configuration template.
 
     Args:
         output_path: Where to write the config file.
-        host: Default host URL.
+        host: Default host URL. When left None, a host declared by the spec's
+            ``servers``/``host`` is used, and localhost only as a last resort.
         openapi_path: Optional path to OpenAPI spec for pre-populating the scenario.
     """
     requests: List[Dict[str, Any]] = []
     auth_block: Optional[Dict[str, Any]] = None
     on_start: Optional[List[Dict[str, Any]]] = None
     flows: Optional[List[Dict[str, Any]]] = None
+    spec_host = ""
 
     if openapi_path and openapi_path.exists():
         spec = _load_openapi(openapi_path)
+        spec_host = _base_url(spec)[0]
         scaffold = _scaffold_scenario(spec)
         requests = scaffold.get("requests") or []
         auth_block = scaffold.get("auth")
         on_start = scaffold.get("on_start")
         flows = scaffold.get("flows")
+
+    host = host or spec_host or DEFAULT_HOST
 
     # If the spec produced no requests AND no flows, add example placeholders.
     # (When endpoints fold into flows, an empty flat request list is expected.)
