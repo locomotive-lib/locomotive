@@ -938,6 +938,7 @@ The Action automatically:
 - Downloads **branch-aware baseline** — on PR uses the target branch's baseline, on push uses the current branch's baseline, with fallback to `main`
 - Runs tests, analysis, and generates the HTML report
 - Uploads the HTML report and all artifacts (metrics, analysis, CSV) to GitHub Actions Artifacts
+- Writes a job summary — verdict, baseline/current/delta per check and a per-endpoint table, rendered on the run page itself, so reading the result does not mean downloading and unzipping an artifact
 - Saves baseline on successful runs (`set_baseline: true` by default)
 - Posts a PR comment with the verdict and a baseline/current/delta table — a `p95` of 220 ms reads as fine until the comment says the previous run did it in 120
 
