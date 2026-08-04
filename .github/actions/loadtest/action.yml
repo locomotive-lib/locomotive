@@ -315,8 +315,7 @@ runs:
           }
 
           if (analysis.baseline_id) lines.push(`Compared against \`${analysis.baseline_id}\`.`, '');
-          lines.push(`[Download the full HTML report](../actions/runs/`
-                     + `${process.env.GITHUB_RUN_ID || ''}#artifacts)`);
+          lines.push('The HTML report with charts is in the artifacts of this run.');
 
           await core.summary.addRaw(lines.join('\n')).write();
 
@@ -503,7 +502,30 @@ runs:
                      + (res.fail != null ? ` (fails at ${res.fail})` : '');
             });
 
-          const runId = process.env.GITHUB_RUN_ID || 'unknown';
+          const runId = process.env.GITHUB_RUN_ID || '';
+          const repoUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}`;
+          const runUrl = `${repoUrl}/actions/runs/${runId}`;
+
+          // Ссылка на прогон ведёт на сводку — её можно читать глазами.
+          // Отдельно даём прямую ссылку на скачивание архива с HTML-отчётом:
+          // её адрес требует идентификатора артефакта, а он есть только в API.
+          const links = [`[Full breakdown on the run page](${runUrl})`];
+          try {
+            const {data} = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: Number(runId),
+            });
+            const artifact = (data.artifacts || [])
+              .filter(item => !item.expired)
+              .find(item => item.name.startsWith('${{ inputs.results_artifact }}'));
+            if (artifact) {
+              links.push(`[Download the HTML report](${runUrl}/artifacts/${artifact.id})`);
+            }
+          } catch (err) {
+            console.log(`Could not resolve the results artifact: ${err.message}`);
+          }
+
           const body = [
             `## Load Test Results — ${statusText}`,
             '',
@@ -513,7 +535,7 @@ runs:
             '',
             ...(failed.length ? [`**What tripped:** ${failed.join('; ')}`, ''] : []),
             ...(analysis.baseline_id ? [`Compared against \`${analysis.baseline_id}\`.`, ''] : []),
-            `[Full report and artifacts](../actions/runs/${runId}#artifacts)`
+            links.join(' · ')
           ].join('\n');
 
           github.rest.issues.createComment({
