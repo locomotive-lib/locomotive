@@ -939,7 +939,7 @@ The Action automatically:
 - Runs tests, analysis, and generates the HTML report
 - Uploads the HTML report and all artifacts (metrics, analysis, CSV) to GitHub Actions Artifacts
 - Saves baseline on successful runs (`set_baseline: true` by default)
-- Posts a summary with metrics as a PR comment
+- Posts a PR comment with the verdict and a baseline/current/delta table — a `p95` of 220 ms reads as fine until the comment says the previous run did it in 120
 
 Action parameters:
 

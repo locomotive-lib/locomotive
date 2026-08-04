@@ -326,19 +326,90 @@ runs:
             }
           }
 
+          // A verdict without the number it was compared against is not a
+          // verdict: "P95 220 ms" reads as fine until you know the previous
+          // run did it in 120. So the table carries baseline, current and the
+          // delta, taken from the analysis where it exists.
+          const analysis = fs.existsSync(analysisPath)
+            ? JSON.parse(fs.readFileSync(analysisPath, 'utf8'))
+            : {};
+          const results = Array.isArray(analysis.results) ? analysis.results : [];
+          const byMetric = {};
+          for (const res of results) {
+            if (res && res.mode !== 'gate' && res.metric && byMetric[res.metric] === undefined) {
+              byMetric[res.metric] = res;
+            }
+          }
+
+          // Не на каждую метрику есть правило, а показать «было» хочется для
+          // всех — baseline лежит рядом в том же артефакте.
+          let baselineMetrics = {};
+          if (analysis.baseline_id) {
+            const baselinePath = path.join(artifactsDir, analysis.baseline_id, 'metrics.json');
+            if (fs.existsSync(baselinePath)) {
+              try {
+                baselineMetrics = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+              } catch (err) {
+                console.log(`Could not read baseline metrics: ${err.message}`);
+              }
+            }
+          }
+
+          const unit = {rps: '', avg_ms: ' ms', p95_ms: ' ms', p99_ms: ' ms', error_rate: '%'};
+          const label = {
+            rps: 'RPS', avg_ms: 'Avg Response', p95_ms: 'P95 Response',
+            p99_ms: 'P99 Response', error_rate: 'Error Rate', requests: 'Total Requests',
+          };
+          const cell = (val, metric) => val == null ? '—' : `${fmt(val)}${unit[metric] || ''}`;
+          const delta = (res, base, current) => {
+            let percent = res && res.delta_percent != null ? res.delta_percent : null;
+            if (percent == null && typeof base === 'number' && typeof current === 'number' && base !== 0) {
+              percent = (current - base) / base * 100;
+            }
+            if (percent == null) return '—';
+            const text = `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`;
+            // Жирным — только то, по чему вынесен вердикт, остальное справочно.
+            const flagged = res && res.status !== 'PASS' && res.status !== 'SKIP';
+            return flagged ? `**${text}**` : text;
+          };
+
+          const rows = [];
+          for (const metric of ['p95_ms', 'avg_ms', 'rps', 'error_rate']) {
+            const res = byMetric[metric];
+            const current = metrics[metric];
+            const base = res && res.baseline != null ? res.baseline : baselineMetrics[metric];
+            if (current == null && base == null) continue;
+            rows.push(`| ${label[metric]} | ${cell(base, metric)} `
+                      + `| ${cell(current, metric)} | ${delta(res, base, current)} |`);
+          }
+          const baseRequests = baselineMetrics.requests == null ? '—' : baselineMetrics.requests;
+          rows.push(`| ${label.requests} | ${baseRequests} | ${requests} | — |`);
+
+          // Что именно не прошло — иначе статус приходится выводить из таблицы.
+          const failed = results
+            .filter(res => res && (res.status === 'DEGRADATION' || res.status === 'WARNING'))
+            .map(res => {
+              const name = res.metric;
+              if (res.delta_percent != null) {
+                const sign = res.delta_percent > 0 ? '+' : '';
+                return `${name} ${sign}${res.delta_percent.toFixed(1)}% vs baseline`
+                       + (res.fail != null ? ` (fails at ${res.fail}%)` : '');
+              }
+              return `${name} ${fmt(res.current)}`
+                     + (res.fail != null ? ` (fails at ${res.fail})` : '');
+            });
+
           const runId = process.env.GITHUB_RUN_ID || 'unknown';
           const body = [
             `## Load Test Results — ${statusText}`,
             '',
-            '| Metric | Value |',
-            '|--------|-------|',
-            `| RPS | ${rps} |`,
-            `| Avg Response | ${avgMs} ms |`,
-            `| P95 Response | ${p95Ms} ms |`,
-            `| Error Rate | ${errorRate}% |`,
-            `| Total Requests | ${requests} |`,
+            '| Metric | Baseline | Current | Change |',
+            '|--------|---------:|--------:|-------:|',
+            ...rows,
             '',
-            `[View full report](../actions/runs/${runId})`
+            ...(failed.length ? [`**What tripped:** ${failed.join('; ')}`, ''] : []),
+            ...(analysis.baseline_id ? [`Compared against \`${analysis.baseline_id}\`.`, ''] : []),
+            `[Full report and artifacts](../actions/runs/${runId}#artifacts)`
           ].join('\n');
 
           github.rest.issues.createComment({
