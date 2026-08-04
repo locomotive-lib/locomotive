@@ -526,15 +526,29 @@ runs:
             console.log(`Could not resolve the results artifact: ${err.message}`);
           }
 
+          // Прогон без baseline — это не «всё хорошо», это «сравнить было не с
+          // чем». Молча показать зелёный статус здесь опаснее, чем показать
+          // красный: регрессия просто проходит мимо.
+          const noBaseline = !analysis.baseline_id;
+          const heading = noBaseline
+            ? `## Load Test Results — ${statusText}, but nothing to compare against`
+            : `## Load Test Results — ${statusText}`;
+          const baselineNote = noBaseline
+            ? ['> **No baseline was found**, so regression rules were skipped and only the '
+               + 'absolute thresholds ran. A slowdown against the previous run would not have '
+               + 'been caught. On a first run this is expected; otherwise check that the '
+               + 'baseline artifact for the target branch still exists.', '']
+            : [`Compared against \`${analysis.baseline_id}\`.`, ''];
+
           const body = [
-            `## Load Test Results — ${statusText}`,
+            heading,
             '',
             '| Metric | Baseline | Current | Change |',
             '|--------|---------:|--------:|-------:|',
             ...rows,
             '',
             ...(failed.length ? [`**What tripped:** ${failed.join('; ')}`, ''] : []),
-            ...(analysis.baseline_id ? [`Compared against \`${analysis.baseline_id}\`.`, ''] : []),
+            ...baselineNote,
             links.join(' · ')
           ].join('\n');
 
