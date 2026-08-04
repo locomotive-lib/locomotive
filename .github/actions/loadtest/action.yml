@@ -119,11 +119,41 @@ runs:
           echo "Baseline found"
         else
           echo "found=false" >> $GITHUB_OUTPUT
-          echo "No baseline found for branch, will try fallback"
+          echo "No baseline on the first attempt"
+        fi
+
+    # Скачивание артефакта — сетевая операция, и обрыв на ней означает не
+    # «базлайна нет», а «мы его не дотянули». Разница принципиальная: без
+    # повтора одна моргнувшая сеть отключает регрессионный анализ целиком,
+    # и прогон рапортует PASS, ничего ни с чем не сравнив.
+    - name: Retry baseline download (branch)
+      if: steps.check-baseline.outputs.found != 'true'
+      uses: dawidd6/action-download-artifact@v6
+      continue-on-error: true
+      with:
+        github_token: ${{ inputs.github_token || github.token }}
+        workflow: ${{ inputs.workflow }}
+        name: ${{ inputs.baseline_artifact }}
+        path: loadtest-artifacts/
+        branch: ${{ steps.resolve-branch.outputs.baseline_branch }}
+        workflow_conclusion: ""
+        check_artifacts: true
+        if_no_artifact_found: warn
+
+    - name: Check baseline after retry
+      id: check-baseline-retry
+      shell: bash
+      run: |
+        if [ -f "loadtest-artifacts/baseline.json" ]; then
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo "Baseline found"
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo "Still no baseline for this branch, will try the fallback branch"
         fi
 
     - name: Download baseline (fallback)
-      if: steps.check-baseline.outputs.found != 'true' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
+      if: steps.check-baseline-retry.outputs.found != 'true' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
       uses: dawidd6/action-download-artifact@v6
       continue-on-error: true
       with:
@@ -135,6 +165,18 @@ runs:
         workflow_conclusion: ""
         check_artifacts: true
         if_no_artifact_found: warn
+
+    # Прогон без базлайна сравнивает текущие метрики не с прошлым прогоном, а
+    # ни с чем — про это надо сказать вслух в логе, иначе единственным следом
+    # останется зелёный статус.
+    - name: Warn if the comparison has no baseline
+      shell: bash
+      run: |
+        if [ ! -f "loadtest-artifacts/baseline.json" ]; then
+          echo "::warning title=No baseline::Regression rules will be skipped: \
+        the baseline artifact was not downloaded (missing, expired, or the download failed). \
+        Only absolute thresholds will run, so a slowdown against the previous run cannot be caught."
+        fi
 
     - name: Sync storage path
       shell: bash
@@ -534,10 +576,10 @@ runs:
             ? `## Load Test Results — ${statusText}, but nothing to compare against`
             : `## Load Test Results — ${statusText}`;
           const baselineNote = noBaseline
-            ? ['> **No baseline was found**, so regression rules were skipped and only the '
+            ? ['> **No baseline was used**, so regression rules were skipped and only the '
                + 'absolute thresholds ran. A slowdown against the previous run would not have '
-               + 'been caught. On a first run this is expected; otherwise check that the '
-               + 'baseline artifact for the target branch still exists.', '']
+               + 'been caught. On a first run this is expected; otherwise the baseline artifact '
+               + 'is missing, expired, or its download failed — the run log says which.', '']
             : [`Compared against \`${analysis.baseline_id}\`.`, ''];
 
           const body = [
