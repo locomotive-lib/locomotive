@@ -272,6 +272,15 @@ def parse_locust_stats_history(path: Path) -> List[Dict[str, Any]]:
     return history
 
 
+# Разбивка отказов для прогона, в котором отказов не было.
+_ZERO_FAILURE_BREAKDOWN = {
+    "failures_4xx": 0,
+    "failures_5xx": 0,
+    "failures_503": 0,
+    "failures_other": 0,
+}
+
+
 def _apply_failure_rates(metrics: Dict[str, Any], breakdown: Dict[str, Any]) -> None:
     requests = _safe_float(metrics.get("requests"))
     if not requests:
@@ -519,11 +528,17 @@ class LocustLauncher:
         if stats_path:
             metrics = parse_locust_stats(stats_path)
             failures_path = _find_failures_csv(raw_dir)
-            if failures_path:
-                breakdown = parse_locust_failures(failures_path)
-                if breakdown:
-                    metrics.update(breakdown)
-                    _apply_failure_rates(metrics, breakdown)
+            breakdown = parse_locust_failures(failures_path) if failures_path else {}
+            if not breakdown and _safe_int(metrics.get("failures")) == 0:
+                # Locust пишет файл ошибок с одной шапкой, когда отказов не
+                # было, и разбор возвращает пустой словарь. Это не «данных
+                # нет», а «отказов нет»: без явных нулей пороги по
+                # подкатегориям ошибок отвечают NO_DATA на безупречном
+                # прогоне, а NO_DATA запрещает сохранить его как baseline.
+                breakdown = _ZERO_FAILURE_BREAKDOWN.copy()
+            if breakdown:
+                metrics.update(breakdown)
+                _apply_failure_rates(metrics, breakdown)
             self.storage.save_json(self.storage.metrics_path(self.run_id), metrics)
 
         run_meta = {

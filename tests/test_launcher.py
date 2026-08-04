@@ -551,3 +551,65 @@ class TestTopologyIsRecorded:
         launcher.run()
         meta = storage.load_json(storage.run_meta_path("run-1"))
         assert meta["topology"] == {"role": "standalone", "load_generators": 1}
+
+
+class TestCleanRunHasZeroErrorRates:
+    """Прогон без единого отказа обязан давать нули, а не пустоту.
+
+    Locust оставляет файл ошибок с одной шапкой, когда падать было нечему.
+    Если из этого не сделать явные нули, пороги по подкатегориям ошибок
+    отвечают NO_DATA, а NO_DATA запрещает сохранить прогон как baseline —
+    то есть безупречный прогон отвергается за то, что он безупречен.
+    """
+
+    STATS_CSV = (
+        "Type,Name,Request Count,Failure Count,Median Response Time,"
+        "Average Response Time,Min Response Time,Max Response Time,"
+        "Average Content Size,Requests/s,Failures/s,50%,66%,75%,80%,"
+        "90%,95%,98%,99%,99.9%,99.99%,100%\n"
+        ',"Aggregated",1000,0,115,120.0,75,500,2048,100.0,0.0,'
+        "115,125,135,145,165,195,245,295,395,480,500\n"
+    )
+    EMPTY_FAILURES_CSV = "Method,Name,Error,Occurrences\n"
+
+    def _run(self, tmp_path, spawned, failures_csv):
+        storage, launcher = _launcher(tmp_path)
+        raw = storage.raw_dir("run-1")
+        raw.mkdir(parents=True, exist_ok=True)
+
+        class Writer(FakeProcess):
+            def wait(self, timeout=None):
+                (raw / "locust_stats.csv").write_text(
+                    TestCleanRunHasZeroErrorRates.STATS_CSV)
+                if failures_csv is not None:
+                    (raw / "locust_failures.csv").write_text(failures_csv)
+                return super().wait(timeout)
+
+        spawned["proc"] = Writer(0)
+        launcher.run()
+        return storage.load_json(storage.metrics_path("run-1"))
+
+    def test_error_rates_are_zero_not_missing(self, tmp_path, spawned):
+        metrics = self._run(tmp_path, spawned, self.EMPTY_FAILURES_CSV)
+        assert metrics["error_rate_503"] == 0
+        assert metrics["error_rate_non_503"] == 0
+        assert metrics["error_rate_4xx"] == 0
+        assert metrics["error_rate_5xx"] == 0
+
+    def test_failure_counts_are_zero_not_missing(self, tmp_path, spawned):
+        metrics = self._run(tmp_path, spawned, self.EMPTY_FAILURES_CSV)
+        assert metrics["failures_503"] == 0
+        assert metrics["failures_non_503"] == 0
+
+    def test_a_missing_failures_file_also_means_no_failures(self, tmp_path, spawned):
+        # Файла может не быть вовсе — счётчик отказов всё равно говорит ноль.
+        metrics = self._run(tmp_path, spawned, None)
+        assert metrics["error_rate_503"] == 0
+
+    def test_real_failures_are_still_counted(self, tmp_path, spawned):
+        failures = (
+            "Method,Name,Error,Occurrences\n"
+            "GET,/x,HTTPError('503 Server Error'),7\n"
+        )
+        metrics = self._run(tmp_path, spawned, failures)
+        assert metrics["failures_503"] == 7
