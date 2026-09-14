@@ -194,7 +194,10 @@ def publishResults(Map opts) {
     String results = opts.resultsDir
     // The storage directory is archived for the next build to copy as its
     // baseline; the results directory is for people.
-    archiveArtifacts(artifacts: "${opts.storage}/**, ${results}/**", allowEmptyArchive: true, fingerprint: false)
+    // Bytecode of the generated locustfile would otherwise ride along in every
+    // baseline handed from build to build.
+    archiveArtifacts(artifacts: "${opts.storage}/**, ${results}/**", excludes: '**/__pycache__/**',
+                     allowEmptyArchive: true, fingerprint: false)
     if (opts.junit) {
         try {
             // The exit code decides the build result; the test report only
