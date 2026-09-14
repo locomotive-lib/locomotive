@@ -110,6 +110,23 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}m {secs}s"
 
 
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+
+
+def _short_id(value: Any) -> str:
+    """A run id short enough for the header, without hiding what tells runs apart.
+
+    A bare commit SHA is cut to 12 characters, as it always was. The ids
+    Locomotive builds itself — ``<short commit>-<build id>`` — are kept whole:
+    cut at 12 they left exactly the shared commit, so a rebuild and the
+    baseline it was compared with both read ``042d14c81983``.
+    """
+    text = str(value)
+    if _FULL_SHA.match(text):
+        return text[:12]
+    return text if len(text) <= 40 else text[:40] + "…"
+
+
 def _status_class(status: str) -> str:
     return {
         "PASS":        "status-pass",
@@ -556,8 +573,8 @@ class ReportRenderer:
 
     def _render_header(self) -> str:
         title_safe = html.escape(self.cfg.title)
-        run_id = html.escape(str(self.run_meta.get("run_id", "-"))[:12])
-        baseline_id = html.escape(str(self.run_meta.get("baseline_id") or "-")[:12])
+        run_id = html.escape(_short_id(self.run_meta.get("run_id", "-")))
+        baseline_id = html.escape(_short_id(self.run_meta.get("baseline_id") or "-"))
         badge_cls = _status_class(self.status).replace("status-", "")
 
         return (

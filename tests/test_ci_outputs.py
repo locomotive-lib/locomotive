@@ -294,6 +294,16 @@ class TestReportHeader:
         page = render({"provider": "jenkins", "branch": "<script>x</script>"})
         assert "<script>x</script>" not in page
 
+    def test_run_ids_that_share_a_commit_stay_apart(self):
+        # Cut at 12 characters, a rebuild and its baseline both read "042d14c81983".
+        page = render_report({"run_id": "042d14c81983-3", "baseline_id": "042d14c81983-2"},
+                             {"requests": 1}, None, None, "T")
+        assert "Run: 042d14c81983-3 | Baseline: 042d14c81983-2" in page
+
+    def test_a_full_sha_is_still_shortened(self):
+        page = render_report({"run_id": "a" * 40}, {"requests": 1}, None, None, "T")
+        assert "Run: aaaaaaaaaaaa |" in page
+
     def test_nothing_for_a_local_run(self):
         assert "Build" not in render({"provider": "local"})
         assert "Build" not in render()
