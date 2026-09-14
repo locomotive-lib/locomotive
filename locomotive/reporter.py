@@ -249,8 +249,10 @@ class ReportRenderer:
         stats_history: Optional[List[Dict[str, Any]]] = None,
         endpoint_stats: Optional[List[Dict[str, Any]]] = None,
         history_runs: Optional[List[Dict[str, Any]]] = None,
+        stylesheet: Optional[str] = None,
     ):
         self.cfg = config
+        self.stylesheet = stylesheet
         self.run_meta = run_meta
         self.current = current_metrics
         self.baseline = baseline_metrics
@@ -287,6 +289,7 @@ class ReportRenderer:
             f"  <title>{title_safe}</title>\n"
             f"{self._chart_js_tag()}"
             f"  <style>\n{self._build_css()}\n  </style>\n"
+            f"{self._stylesheet_tag()}"
             "</head>\n"
             "<body>\n"
             '  <div class="container">\n'
@@ -300,6 +303,16 @@ class ReportRenderer:
     # ------------------------------------------------------------------
     # CSS
     # ------------------------------------------------------------------
+
+    def _stylesheet_tag(self) -> str:
+        # The same rules as the <style> block, from a file next to the report.
+        # Where a Content-Security-Policy refuses inline styles — Jenkins serves
+        # published reports with `style-src 'self'` — the file still applies;
+        # where the file is missing, as with a report.html downloaded on its
+        # own, the inline copy does.
+        if not self.stylesheet:
+            return ""
+        return f'  <link rel="stylesheet" href="{html.escape(self.stylesheet, quote=True)}" />\n'
 
     def _build_css(self) -> str:
         parts = [self._css_base()]
@@ -1022,6 +1035,7 @@ def render_report(
     endpoint_stats: Optional[List[Dict[str, Any]]] = None,
     report_config: Optional[ReportConfig] = None,
     history_runs: Optional[List[Dict[str, Any]]] = None,
+    stylesheet: Optional[str] = None,
 ) -> str:
     if report_config is None:
         report_config = resolve_report_config({"title": title})
@@ -1037,4 +1051,16 @@ def render_report(
         stats_history=stats_history,
         endpoint_stats=endpoint_stats,
         history_runs=history_runs,
+        stylesheet=stylesheet,
     ).render()
+
+
+def render_stylesheet(report_config: Optional[ReportConfig] = None) -> str:
+    """The report's CSS on its own, for the file linked from the report.
+
+    Jenkins serves published reports with ``style-src 'self'``: the inline
+    ``<style>`` block is refused, and the report used to open unstyled, but a
+    stylesheet from the same directory is allowed.
+    """
+    config = report_config if report_config is not None else resolve_report_config({})
+    return ReportRenderer(config, {}, {}, None, None)._build_css() + "\n"

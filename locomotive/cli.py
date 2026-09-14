@@ -15,7 +15,7 @@ from .ci import default_run_id, detect_ci
 from .config import load_config, load_config_raw
 from .gate import evaluate_gate, summarize_history
 from .launcher import LocustLauncher, find_stats_history_csv, parse_locust_stats_history
-from .reporter import render_report, load_stats_history, load_endpoint_stats
+from .reporter import render_report, render_stylesheet, load_stats_history, load_endpoint_stats
 from .scenario import generate_locustfile
 from .storage import Storage
 from .template import generate_github_workflow, generate_jenkinsfile, generate_template
@@ -318,27 +318,36 @@ def _report(
     if title:
         cfg.title = title
 
-    html = render_report(
-        run_meta,
-        current_metrics,
-        baseline_metrics,
-        analysis,
-        title,
-        stats_history=stats_history,
-        endpoint_stats=endpoint_stats,
-        report_config=cfg,
-        history_runs=history_runs,
-    )
+    css = render_stylesheet(cfg)
+
+    def write(target: Path) -> None:
+        # Every copy of the report gets its stylesheet beside it, named after
+        # it, so a viewer that refuses inline styles still finds the rules.
+        stylesheet = target.with_suffix(".css")
+        html = render_report(
+            run_meta,
+            current_metrics,
+            baseline_metrics,
+            analysis,
+            title,
+            stats_history=stats_history,
+            endpoint_stats=endpoint_stats,
+            report_config=cfg,
+            history_runs=history_runs,
+            stylesheet=stylesheet.name,
+        )
+        storage.save_text(target, html)
+        storage.save_text(stylesheet, css)
 
     # Always save report in the run directory
     run_report = storage.report_path(run_id)
-    storage.save_text(run_report, html)
+    write(run_report)
 
     # Also save to custom output path if specified
     if output_path:
         output = Path(output_path)
         if output.resolve() != run_report.resolve():
-            storage.save_text(output, html)
+            write(output)
 
     return str(output_path or run_report)
 

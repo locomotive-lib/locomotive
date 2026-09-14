@@ -132,9 +132,10 @@ Bitbucket is not supported yet; the build says so and carries on.
 ## Seeing the charts
 
 Jenkins serves published reports under a Content-Security-Policy that blocks
-scripts and inline styles, so on a default installation the report opens with
-its tables but without charts or styling, and each chart says why. Ask the
-administrator to set a
+scripts and inline styles. The report brings its styles in a `report.css` next
+to `report.html`, which that policy allows, so it keeps its look; the charts
+need JavaScript, so on a default installation each one says why it is empty.
+To get them, ask the administrator to set a
 [Resource Root URL](https://www.jenkins.io/doc/book/security/user-content/#resource-root-url)
-— the recommended fix — rather than relaxing the policy. The archived
-`report.html` opened from a download always shows everything.
+— the recommended fix — rather than relaxing the policy. A downloaded
+`report.html` opened locally always shows everything.

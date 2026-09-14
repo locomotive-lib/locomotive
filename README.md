@@ -926,9 +926,10 @@ body without posting. It uses only the standard library.
 Charts in the report are drawn by Chart.js, loaded from a pinned jsDelivr URL.
 On runners without internet access, point `report.chart_js_url` at a copy on an
 internal mirror. Jenkins serves published HTML under a Content-Security-Policy
-that blocks every script and inline style: the report stays readable — the
-numbers are in its tables — and each chart says why it is empty. To get the
-charts back, configure a
+that blocks every script and inline style. The report's styles are therefore
+also written to a stylesheet beside it (`report.css` next to `report.html`),
+which that policy allows, so the page keeps its look; only the charts, which
+need JavaScript, stay empty and say why. To get the charts back, configure a
 [Resource Root URL](https://www.jenkins.io/doc/book/security/user-content/#resource-root-url)
 rather than relaxing the policy.
 
@@ -1529,6 +1530,7 @@ artifacts/
         ├── metrics.json     # aggregated metrics
         ├── analysis.json    # analysis results (statuses, deltas)
         ├── report.html      # HTML report
+        ├── report.css       # its styles, also inline; for viewers that block inline styles (Jenkins)
         ├── generated/       # generated locustfile
         └── raw/             # raw Locust CSV files
 ```
