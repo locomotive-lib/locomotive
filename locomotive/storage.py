@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 
 from .utils import read_json, write_json, write_text, utc_now, ensure_dir
 
@@ -61,6 +62,19 @@ class Storage:
             return None
         data = self.load_json(path)
         return data.get("run_id")
+
+    def prune_runs(self, keep: Iterable[Optional[str]]) -> List[str]:
+        """Delete every stored run not named in *keep*; return what was removed."""
+        keep_ids = {run_id for run_id in keep if run_id}
+        runs = self.runs_dir()
+        if not runs.is_dir():
+            return []
+        removed: List[str] = []
+        for path in sorted(runs.iterdir()):
+            if path.is_dir() and path.name not in keep_ids:
+                shutil.rmtree(path)
+                removed.append(path.name)
+        return removed
 
     def history_path(self) -> Path:
         return self.root / "history.json"

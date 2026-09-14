@@ -25,6 +25,11 @@ _CSS_VALUE_RE = re.compile(r"^[A-Za-z0-9 #%(),.\-_+]{1,64}$")
 _CSS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+# Pinned: an unversioned CDN URL silently picks up the next major release.
+# Point report.chart_js_url at an internal mirror where the CDN is unreachable.
+DEFAULT_CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+
+
 def css_name(name: Any) -> Optional[str]:
     """A custom-property name safe to write into a stylesheet, or ``None``."""
     text = str(name)
@@ -105,6 +110,7 @@ class ReportConfig:
     endpoint_columns: List[EndpointColumnConfig] = field(default_factory=list)
     trends: TrendsConfig = field(default_factory=TrendsConfig)
     timezone: str = "UTC"
+    chart_js_url: str = DEFAULT_CHART_JS_URL
 
 
 # ---------------------------------------------------------------------------
@@ -422,4 +428,9 @@ def resolve_report_config(raw: Dict[str, Any]) -> ReportConfig:
         endpoint_columns=ep_columns,
         trends=trends,
         timezone=merged.get("timezone", "UTC"),
+        chart_js_url=(
+            merged["chart_js_url"].strip()
+            if isinstance(merged.get("chart_js_url"), str)
+            else DEFAULT_CHART_JS_URL
+        ),
     )

@@ -688,11 +688,11 @@ When using the built-in GitHub Action, baselines are **branch-aware**:
 |----------|----------------|-----|
 | **Push to branch** | Latest baseline from **the same branch** | Track regressions within the branch |
 | **Pull request** | Latest baseline from **the target branch** | Show what the PR would change in the target |
-| **First run on a new branch** | Falls back to **main** branch baseline | New branches start from the main baseline |
+| **First run on a new branch** | Falls back to the **default branch** baseline | New branches start from the default branch's baseline |
 
 Each branch listed in `push.branches` maintains its own baseline. PRs always compare against the target branch (e.g., a PR into `main` uses `main`'s baseline, a PR into `release` uses `release`'s baseline).
 
-You can change the fallback branch via the `fallback_branch` input (default: `main`).
+You can change the fallback branch via the `fallback_branch` input (default: the repository's default branch).
 
 ### Analysis rules
 
@@ -746,6 +746,7 @@ Rules can be extracted to a separate file:
 | `direction` | Which direction is degradation | `increase` — degradation on growth (latency, errors); `decrease` — degradation on drop (rps) |
 | `warn` / `fail` | Thresholds | Exceeding `warn` → WARNING, `fail` → DEGRADATION |
 | `fail_on` | When CI should fail | `"DEGRADATION"` (default) or `"WARNING"` (stricter); case-insensitive |
+| `warning_exit_code` | Exit code when the worst result is `WARNING` and `fail_on` does not fail it — lets a CI show a warning state (see [Running in any CI](#running-in-any-ci)) | `0` (default) to `255`; `--warning-exit-code` overrides it |
 | `rules_advisory` | Report regression rules but let only the gate decide the exit code | `false` (default) or `true` |
 | `allow_no_data` | Treat `NO_DATA` as `SKIP` instead of failing the build | `false` (default) or `true` |
 
@@ -754,7 +755,7 @@ Rules can be extracted to a separate file:
 | Status | Meaning | Exit code |
 |--------|---------|-----------|
 | **PASS** | Metric is within acceptable range | 0 |
-| **WARNING** | Minor deviation (exceeded `warn`) | 0 (or 1 if `fail_on: "WARNING"`) |
+| **WARNING** | Minor deviation (exceeded `warn`) | 0 (1 if `fail_on: "WARNING"`; `warning_exit_code` if set) |
 | **DEGRADATION** | Significant degradation (exceeded `fail`) | 1 |
 | **NO_DATA** | The check *should* have run but there was nothing to measure: the run recorded 0 requests, fewer than `gate.min_requests`, or the metric a rule names was never produced | 1 (regardless of `fail_on`) |
 | **SKIP** | The check does not apply yet — typically a first run with no baseline to compare against | 0 |
@@ -841,7 +842,6 @@ Result storage settings:
 {
   "artifacts": {
     "storage": "artifacts",              // artifact storage directory (default: "artifacts")
-    "run_id": "${GITHUB_SHA:-local}",    // run ID; in CI resolves to commit SHA, locally — "local"
     "history": 30                        // number of recent runs to keep for trend charts (0 = disabled)
   }
 }
@@ -850,14 +850,86 @@ Result storage settings:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `storage` | `"artifacts"` | Artifact directory path |
-| `run_id` | timestamp | Run ID; defaults to `run-<timestamp>`, in CI resolves to `GITHUB_SHA` / `GITHUB_RUN_ID` / `CI_PIPELINE_ID` |
+| `run_id` | detected | Run ID. Best left unset: in GitHub Actions, GitLab CI and Jenkins it defaults to `<short commit>-<build id>`, which is different for every build *and* every re-run; locally it is `run-<timestamp>` |
 | `history` | `0` (disabled) | Number of runs in `history.json` for trend charts; `0` disables history tracking |
+
+A run id has to be unique per run, and a constant one is how a regression goes
+green: the second run lands in the baseline's own directory and is compared with
+itself. Locomotive refuses to do that — when a run's id is already the
+baseline's (for example `${GITHUB_SHA:-local}` outside GitHub, which older
+generated configs contain, or a re-run of the commit that set the baseline), the
+run is recorded as `<id>-2` and compared against the baseline as usual, with a
+warning pointing at `artifacts.run_id`.
 
 Every file Locomotive writes into the artifact directory is written whole or not
 at all: it goes to a temporary file in the same directory, is flushed to disk,
 and is then renamed into place. A run interrupted mid-write — Ctrl-C, a CI job
 cancelled, a full disk — leaves the previous `baseline.json` and `history.json`
 intact instead of a truncated file that the next run cannot parse.
+
+## Running in any CI
+
+`loco ci` behaves the same in every CI system. The GitHub Action and the CI
+templates are thin wrappers over the pieces below, and you can use them
+directly in any pipeline.
+
+### What Locomotive reads from the CI
+
+GitHub Actions, GitLab CI and Jenkins are recognised from their environment
+variables. The commit, branch, pull/merge request and a link to the build are
+recorded in `run.json` and shown in the report header, and the default run id is
+`<short commit>-<build id>` — different for every build and every re-run.
+
+### Outputs for CI systems
+
+| Flag | What it writes | Where it shows up |
+|------|----------------|-------------------|
+| `--summary summary.md` | Markdown: status, metrics against the baseline, every check worst-first | Pull/merge request comment via `loco comment`; `$GITHUB_STEP_SUMMARY` |
+| `--junit junit.xml` | One test case per rule, gate threshold and sanity check | GitLab merge request test widget; Jenkins `junit` step (and GitHub Checks through it) |
+| `--warning-exit-code 2` | Exit code `2` instead of `0` when the worst result is `WARNING` | GitLab `allow_failure: exit_codes: [2]` (orange job); Jenkins `unstable()` |
+| `--prune` (`ci` only) | Deletes stored runs other than this one and the baseline | Keeps the archived artifact directory — the next build's baseline source — small |
+
+In the JUnit file `DEGRADATION` and `NO_DATA` are failures, `SKIP` is skipped,
+and `WARNING` is a failure only under `fail_on: "WARNING"` — otherwise it passes
+and says so in its output. The file describes the checks; the exit code decides
+the build. `--summary` and `--junit` also work on `loco report`, for artifacts an
+earlier step produced.
+
+### `loco comment` — one comment per pull/merge request
+
+```bash
+loco --config loconfig.json ci --summary .loco/summary.md
+loco comment --body .loco/summary.md
+```
+
+Posts the summary to the pull or merge request the build belongs to, and on the
+next push edits that same comment instead of adding another — it is found again
+by a hidden marker (`--key` keeps separate comments for separate jobs). On a
+build that is not for a pull/merge request it does nothing and exits `0`.
+
+The comment goes through the code host's API, not the CI's, so a Jenkins build of
+a GitHub pull request comments on GitHub:
+
+| Build | Where the request is found | Token |
+|-------|----------------------------|-------|
+| GitHub Actions | `GITHUB_REPOSITORY` and the event | `GITHUB_TOKEN`, with `pull-requests: write` |
+| GitLab CI, merge request pipeline | `CI_API_V4_URL`, `CI_MERGE_REQUEST_*` | `LOCO_GITLAB_TOKEN`: a project access token with the `api` scope, Reporter or above. `CI_JOB_TOKEN` cannot write comments |
+| Jenkins multibranch | parsed from `CHANGE_URL` (GitHub, GitHub Enterprise, GitLab) | `LOCO_GITHUB_TOKEN` or `LOCO_GITLAB_TOKEN`, e.g. bound with `withCredentials` |
+
+`--host`, `--api-url`, `--project` and `--number` override what is detected,
+`--token-env` names another variable, and `--dry-run` prints the target and the
+body without posting. It uses only the standard library.
+
+### Reports where scripts do not run
+
+Charts in the report are drawn by Chart.js, loaded from a pinned jsDelivr URL.
+On runners without internet access, point `report.chart_js_url` at a copy on an
+internal mirror. Jenkins serves published HTML under a Content-Security-Policy
+that blocks every script and inline style: the report stays readable — the
+numbers are in its tables — and each chart says why it is empty. To get the
+charts back, configure a
+[Resource Root URL](https://www.jenkins.io/doc/book/security/user-content/#resource-root-url)
+rather than relaxing the policy.
 
 ## GitHub Actions
 
@@ -906,7 +978,7 @@ jobs:
 
 ### Built-in Action (with HTML reports, PR comments, and artifacts)
 
-Locomotive ships with a GitHub Action that handles everything: installation, test execution, HTML report generation, baseline management, and artifact uploads.
+Locomotive ships with a GitHub Action that handles everything: installation, test execution, HTML report generation, baseline management, and artifact uploads. `loco init --github-workflow` writes this workflow for you.
 
 ```yaml
 name: Load Test
@@ -915,6 +987,11 @@ on:
   push:
     branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+  actions: read          # find the baseline artifact from earlier runs
+  pull-requests: write   # post the results comment and keep it updated
 
 jobs:
   loadtest:
@@ -934,13 +1011,14 @@ jobs:
 ```
 
 The Action automatically:
-- Installs `locomotive` from PyPI
-- Downloads **branch-aware baseline** — on PR uses the target branch's baseline, on push uses the current branch's baseline, with fallback to `main`
-- Runs tests, analysis, and generates the HTML report
-- Uploads the HTML report and all artifacts (metrics, analysis, CSV) to GitHub Actions Artifacts
-- Writes a job summary — verdict, baseline/current/delta per check and a per-endpoint table, rendered on the run page itself, so reading the result does not mean downloading and unzipping an artifact
+- Installs the Locomotive that ships with the action's own commit, so the action and the CLI flags it uses always match (set `locomotive_version` to install a release from PyPI instead)
+- Downloads a **branch-aware baseline** — on PR the target branch's, on push the current branch's, falling back to the repository's default branch — retrying once, and warning in the log when there is none
+- Runs tests, analysis and the HTML report with `loco ci --summary --junit --prune` (see [Running in any CI](#running-in-any-ci)); the artifact carries only the baseline run and this one
+- Uploads the HTML report and all run data (metrics, analysis, CSV) as an artifact, and the baseline as another
+- Writes the job summary — verdict, what tripped, baseline/current/change, every check and a collapsible per-endpoint table — on the run page itself, so reading the result does not mean downloading and unzipping an artifact
 - Saves baseline on successful runs (`set_baseline: true` by default)
-- Posts a PR comment with the verdict and a baseline/current/delta table — a `p95` of 220 ms reads as fine until the comment says the previous run did it in 120
+- Posts the same summary as a PR comment with a link to the report, and edits that one comment on every later push instead of adding another — a `p95` of 220 ms reads as fine until the comment says the previous run did it in 120
+- Hands branch names and inputs to its scripts through environment variables, never by pasting them into a script
 
 Action parameters:
 
@@ -949,13 +1027,15 @@ Action parameters:
 | `config` | `loconfig.json` | Config file path |
 | `users` | from config | Override user count |
 | `run_time` | from config | Override test duration |
+| `args` | (empty) | Extra arguments for `loco ci`, e.g. `--processes 4` |
 | `set_baseline` | `true` | Save run as baseline on success |
-| `post_pr_comment` | `true` | Post results as a PR comment |
+| `post_pr_comment` | `true` | Post results as a PR comment, kept up to date on later pushes |
 | `baseline_artifact` | `loadtest-baseline` | Artifact name for baseline storage |
 | `results_artifact` | `loadtest-results` | Artifact name for results |
 | `workflow` | (empty) | Workflow file name to search for baseline artifacts (empty = search all workflows) |
-| `fallback_branch` | `main` | Fallback branch when no branch-specific baseline exists |
-| `github_token` | `github.token` | Token for PR comments. Uses the built-in `github.token` by default — no need to create a separate token |
+| `fallback_branch` | default branch | Fallback branch when no branch-specific baseline exists |
+| `github_token` | `github.token` | Token for baseline downloads and the PR comment. Uses the built-in `github.token` by default — no need to create a separate token |
+| `locomotive_version` | (empty) | Install this version from PyPI instead of the one shipped with the action |
 
 Action outputs:
 
@@ -963,7 +1043,9 @@ Action outputs:
 |--------|-------------|
 | `metrics_path` | Path to `metrics.json` |
 | `report_path` | Path to `report.html` |
-| `status` | Run status: `PASS`, `WARNING`, or `DEGRADATION` |
+| `status` | Run status: `PASS`, `WARNING`, `DEGRADATION` or `NO_DATA` |
+| `summary_path` | Path to the markdown summary |
+| `junit_path` | Path to JUnit XML with one test case per check — for test reporter actions |
 
 ## Report Customization
 
@@ -1283,6 +1365,15 @@ loco --config loconfig.json analyze --storage DIR --run-id ID [--baseline <run_i
 loco --config loconfig.json report --storage DIR --run-id ID [--baseline <run_id>] [--title "Title"] [--output report.html]
 ```
 
+### `loco comment` — post the summary to the pull/merge request
+
+```bash
+loco comment --body summary.md [--key loadtest] [--dry-run] [--host github|gitlab] [--api-url URL] [--project P] [--number N] [--token-env NAME]
+```
+
+Creates or updates one comment on the build's pull/merge request; needs no
+config file. See [`loco comment`](#loco-comment--one-comment-per-pullmerge-request).
+
 ### Common flags
 
 Global flags, written before the subcommand (`loco --debug ci`):
@@ -1334,6 +1425,7 @@ Additional `analyze` and `ci` flags:
 |------|-------------|
 | `--rules` | Path to external analysis rules file |
 | `--fail-on` | Exit code 1 threshold: `WARNING` or `DEGRADATION` |
+| `--warning-exit-code` | Exit code when the worst result is `WARNING` (default `0`) |
 
 Additional `report` and `ci` flags:
 
@@ -1341,6 +1433,14 @@ Additional `report` and `ci` flags:
 |------|-------------|
 | `--title` | HTML report title |
 | `--output` | HTML report output path |
+| `--summary` | Also write a markdown summary |
+| `--junit` | Also write the checks as JUnit XML |
+
+`ci` only:
+
+| Flag | Description |
+|------|-------------|
+| `--prune` | After reporting, delete stored runs other than this one and the baseline |
 
 ### Exit codes and errors
 

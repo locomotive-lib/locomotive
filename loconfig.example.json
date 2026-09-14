@@ -10,8 +10,7 @@
     "extra_args": []
   },
   "artifacts": {
-    "storage": "artifacts",
-    "run_id": "${GITHUB_SHA}"
+    "storage": "artifacts"
   },
   "analysis": {
     "mode": "resilience",

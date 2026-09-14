@@ -4,13 +4,13 @@ import argparse
 import json
 import os
 import sys
-import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .analyzer import analyze as analyze_metrics
 from .analyzer import load_rules, merge_results, sanity_results, topology_results
+from .ci import default_run_id, detect_ci
 from .config import load_config, load_config_raw
 from .gate import evaluate_gate, summarize_history
 from .launcher import LocustLauncher, find_stats_history_csv, parse_locust_stats_history
@@ -18,6 +18,7 @@ from .reporter import render_report, load_stats_history, load_endpoint_stats
 from .scenario import generate_locustfile
 from .storage import Storage
 from .template import generate_template, generate_github_workflow
+from .utils import write_text
 
 
 DEFAULT_CONFIG = "loconfig.json"
@@ -80,25 +81,11 @@ def _parse_int(value: Any, name: str) -> Optional[int]:
 
 
 def _default_run_id() -> str:
-    for key in ["GITHUB_SHA", "GITHUB_RUN_ID", "CI_PIPELINE_ID"]:
-        value = os.environ.get(key)
-        if value:
-            return value
-    return f"run-{int(time.time())}"
+    return default_run_id(detect_ci())
 
 
 def _collect_ci_meta() -> Dict[str, Any]:
-    keys = [
-        "GITHUB_SHA",
-        "GITHUB_REF",
-        "GITHUB_RUN_ID",
-        "GITHUB_RUN_NUMBER",
-        "GITHUB_REPOSITORY",
-        "GITHUB_WORKFLOW",
-        "GITHUB_ACTIONS",
-    ]
-    meta = {key.lower(): os.environ.get(key) for key in keys if os.environ.get(key)}
-    return meta
+    return detect_ci().to_meta()
 
 
 def _load_rules_from_sources(rules_path: Optional[str], inline_rules: Optional[List[Dict[str, Any]]]) -> List[Any]:
@@ -129,6 +116,40 @@ def _build_storage(args: argparse.Namespace, config: Dict[str, Any]) -> Storage:
 def _build_run_id(args: argparse.Namespace, config: Dict[str, Any]) -> str:
     artifacts = _get_section(config, "artifacts")
     return args.run_id or artifacts.get("run_id") or _default_run_id()
+
+
+def _resolve_baseline_id(
+    args: argparse.Namespace, config: Dict[str, Any], storage: Storage
+) -> Optional[str]:
+    analysis_cfg = _get_section(config, "analysis")
+    return args.baseline or analysis_cfg.get("baseline") or storage.get_baseline()
+
+
+def _avoid_baseline_collision(storage: Storage, run_id: str, baseline_id: Optional[str]) -> str:
+    """Give a run whose id is already the baseline's a fresh id instead.
+
+    Writing that run into the baseline's directory overwrites the numbers it
+    is about to be compared against, and the comparison that follows is the
+    run against itself: every delta is zero and every rule passes. A constant
+    run id does exactly that — ``${GITHUB_SHA:-local}`` anywhere but GitHub,
+    or a re-run of the commit that set the baseline — and it used to turn a
+    fourfold latency regression green.
+
+    Existing run directories are skipped as well, so nothing already recorded
+    is overwritten.
+    """
+    if not baseline_id or run_id != baseline_id:
+        return run_id
+    suffix = 2
+    while storage.run_dir(f"{run_id}-{suffix}").exists():
+        suffix += 1
+    fresh = f"{run_id}-{suffix}"
+    print(
+        f"Warning: run id '{run_id}' is the current baseline; recording this run "
+        f"as '{fresh}' so it is compared against the baseline instead of overwriting it. "
+        "Remove artifacts.run_id from the config to get a unique id per CI build."
+    )
+    return fresh
 
 
 def _build_locust_config(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -321,6 +342,62 @@ def _report(
     return str(output_path or run_report)
 
 
+def _write_exports(
+    args: argparse.Namespace,
+    storage: Storage,
+    run_id: str,
+    baseline_id: Optional[str],
+    analysis_cfg: Dict[str, Any],
+    title: str,
+) -> None:
+    """Write the markdown summary and JUnit XML asked for on the command line."""
+    summary_path = getattr(args, "summary", None)
+    junit_path = getattr(args, "junit", None)
+    if not summary_path and not junit_path:
+        return
+    from .export import load_endpoint_rows, render_junit, render_markdown_summary
+
+    def load(path: Path) -> Optional[Dict[str, Any]]:
+        return storage.load_json(path) if path.exists() else None
+
+    metrics = load(storage.metrics_path(run_id))
+    analysis = load(storage.analysis_path(run_id))
+    if summary_path:
+        baseline_metrics = load(storage.metrics_path(baseline_id)) if baseline_id else None
+        rules_configured = bool(
+            getattr(args, "rules", None) or analysis_cfg.get("rules_file") or analysis_cfg.get("rules")
+        )
+        write_text(Path(summary_path), render_markdown_summary(
+            run_id=run_id,
+            metrics=metrics,
+            analysis=analysis,
+            baseline_id=baseline_id,
+            baseline_metrics=baseline_metrics,
+            run_meta=_load_run_meta(storage, run_id),
+            endpoints=load_endpoint_rows(storage.raw_dir(run_id) / "locust_stats.csv"),
+            rules_configured=rules_configured,
+            title=title,
+        ))
+    if junit_path:
+        fail_on = _resolve_fail_on(getattr(args, "fail_on", None), analysis_cfg)
+        write_text(Path(junit_path), render_junit(
+            run_id=run_id, metrics=metrics, analysis=analysis, fail_on=fail_on,
+        ))
+
+
+def _prune_runs(storage: Storage, run_id: str) -> None:
+    """Keep only this run and the baseline, so the stored artifact stays small.
+
+    The artifacts directory is what a CI system archives and hands to the next
+    build as its baseline, and every run left in it is carried forward again.
+    """
+    keep = {run_id, storage.get_baseline()}
+    removed = storage.prune_runs(keep)
+    if removed:
+        kept = ", ".join(sorted(k for k in keep if k))
+        print(f"Pruned {len(removed)} stored run(s); kept {kept}.")
+
+
 FAIL_ON_LEVELS = ("WARNING", "DEGRADATION")
 
 
@@ -347,6 +424,25 @@ def _resolve_fail_on(args_value: Any, analysis_cfg: Dict[str, Any]) -> str:
         )
         return "DEGRADATION"
     return fail_on
+
+
+def _resolve_warning_exit_code(args_value: Any, analysis_cfg: Dict[str, Any]) -> int:
+    """The exit code for a run whose worst result is WARNING: 0 unless asked.
+
+    CI systems can show a third state between green and red — GitLab's
+    ``allow_failure: exit_codes`` turns a job orange, a Jenkins pipeline marks
+    the build UNSTABLE — but only if the process says so with its exit code.
+    0 stays the default so pipelines that pass on WARNING today keep passing.
+    """
+    raw = args_value if args_value is not None else analysis_cfg.get("warning_exit_code")
+    if raw is None or raw == "":
+        return 0
+    if isinstance(raw, bool):
+        raise ValueError(f"warning_exit_code must be an integer from 0 to 255, got {raw!r}")
+    code = _parse_int(raw, "warning_exit_code")
+    if code is None or not 0 <= code <= 255:
+        raise ValueError(f"warning_exit_code must be an integer from 0 to 255, got {raw!r}")
+    return code
 
 
 def _downgrade_no_data(result_sets: List[List[Dict[str, Any]]]) -> None:
@@ -468,9 +564,11 @@ def cmd_run(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         if code:
             return code
     storage = _build_storage(args, config)
-    run_id = _build_run_id(args, config)
+    run_id = _avoid_baseline_collision(
+        storage, _build_run_id(args, config), _resolve_baseline_id(args, config, storage)
+    )
     locust_config = _build_locust_config(args, config)
-    
+
     _maybe_generate_locustfile(storage, run_id, locust_config, config)
     result = _run(storage, run_id, locust_config)
 
@@ -487,7 +585,11 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
 
     analysis_cfg = _get_section(config, "analysis")
     mode, gate_cfg = _resolve_gate_config(analysis_cfg)
-    baseline_id = args.baseline or analysis_cfg.get("baseline") or storage.get_baseline()
+    baseline_id = _resolve_baseline_id(args, config, storage)
+    if baseline_id and baseline_id == run_id:
+        # Comparing a run with itself proves nothing and passes every rule.
+        print(f"Warning: run '{run_id}' is the baseline itself; skipping the baseline comparison.")
+        baseline_id = None
     if not baseline_id and not mode:
         raise ValueError("baseline run id is required")
 
@@ -535,7 +637,11 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         storage.save_json(storage.analysis_path(run_id), combined)
 
         fail_on = _resolve_fail_on(args.fail_on, analysis_cfg)
-        return _exit_code_for_status(combined.get("status"), fail_on)
+        warning_code = _resolve_warning_exit_code(getattr(args, "warning_exit_code", None), analysis_cfg)
+        code = _exit_code_for_status(combined.get("status"), fail_on)
+        if not code and combined.get("status") == "WARNING":
+            return warning_code
+        return code
 
     return 0
 
@@ -546,13 +652,16 @@ def cmd_report(args: argparse.Namespace, config: Dict[str, Any]) -> int:
 
     analysis_cfg = _get_section(config, "analysis")
     report_cfg = _get_section(config, "report")
-    baseline_id = args.baseline or analysis_cfg.get("baseline") or storage.get_baseline()
+    baseline_id = _resolve_baseline_id(args, config, storage)
+    if baseline_id == run_id:
+        baseline_id = None
     title = args.title or report_cfg.get("title") or "CI Load Test Report"
     output_path = args.output or report_cfg.get("output")
 
     history_runs = storage.load_history().get("runs", [])
     _report(storage, run_id, baseline_id, title, output_path,
             report_cfg=report_cfg, history_runs=history_runs)
+    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title)
     return 0
 
 
@@ -562,8 +671,15 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         code = _preflight_validate(config)
         if code:
             return code
+    # Resolved before the run: a bad value must not wait for the load test to end.
+    warning_code = _resolve_warning_exit_code(
+        getattr(args, "warning_exit_code", None), _get_section(config, "analysis")
+    )
     storage = _build_storage(args, config)
-    run_id = _build_run_id(args, config)
+    # Resolved before the run, which must not be written over the baseline.
+    # The run itself never moves baseline.json, so this stays the baseline.
+    baseline_id = _resolve_baseline_id(args, config, storage)
+    run_id = _avoid_baseline_collision(storage, _build_run_id(args, config), baseline_id)
     locust_config = _build_locust_config(args, config)
 
     _maybe_generate_locustfile(storage, run_id, locust_config, config)
@@ -582,7 +698,6 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     analysis_cfg = _get_section(config, "analysis")
     report_cfg = _get_section(config, "report")
     mode, gate_cfg = _resolve_gate_config(analysis_cfg)
-    baseline_id = args.baseline or analysis_cfg.get("baseline") or storage.get_baseline()
 
     metrics_path = storage.metrics_path(run_id)
     metrics_exist = metrics_path.exists()
@@ -664,11 +779,15 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     output_path = args.output or report_cfg.get("output")
     _report(storage, run_id, baseline_id, title, output_path,
             report_cfg=report_cfg, history_runs=history_runs)
+    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title)
+    if getattr(args, "prune", False):
+        _prune_runs(storage, run_id)
 
     if not metrics_exist:
         return locust_code or 1
 
     code = 0
+    status = None
     if analysis:
         fail_on = _resolve_fail_on(args.fail_on, analysis_cfg)
         if rules_advisory and gate_eval:
@@ -687,7 +806,43 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         return code
     # locust's own exit code (non-zero on --exit-code-on-error, interrupted or
     # crashed runs) must not be swallowed just because the analysis was clean.
-    return locust_code
+    if locust_code:
+        return locust_code
+    if status == "WARNING":
+        return warning_code
+    return 0
+
+
+def cmd_comment(args: argparse.Namespace) -> int:
+    """Post a summary to the build's pull/merge request, editing the earlier one."""
+    from .comment import CommentError, post_comment
+
+    body_path = Path(args.body)
+    if not body_path.is_file():
+        print(f"Error: summary file not found: {body_path}", file=sys.stderr)
+        return 1
+    body = body_path.read_text(encoding="utf-8")
+    try:
+        result = post_comment(
+            body,
+            key=args.key,
+            host=args.host,
+            api_url=args.api_url,
+            project=args.project,
+            number=args.number,
+            token_env=args.token_env,
+            dry_run=args.dry_run,
+        )
+    except CommentError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if result is None:
+        print("Not a pull or merge request build; nothing to comment on.")
+        return 0
+    print(result.describe())
+    if result.action == "dry-run":
+        print(body)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -733,6 +888,35 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_args(ci_parser)
     _add_analyze_args(ci_parser)
     _add_report_args(ci_parser)
+    ci_parser.add_argument(
+        "--prune", action="store_true",
+        help="After reporting, delete stored runs other than this one and the baseline",
+    )
+
+    # comment command
+    comment_parser = subparsers.add_parser(
+        "comment", help="Post or update the run summary on the pull/merge request",
+    )
+    comment_parser.add_argument("--body", required=True, help="Markdown file to post (from `ci --summary`)")
+    comment_parser.add_argument(
+        "--key", default="loadtest",
+        help="Keeps this comment apart from other Locomotive comments on the same request",
+    )
+    comment_parser.add_argument(
+        "--host", choices=["github", "gitlab"],
+        help="Code host, when it cannot be told from the CI environment",
+    )
+    comment_parser.add_argument(
+        "--api-url",
+        help="API base URL (GitHub Enterprise: https://host/api/v3; GitLab: https://host/api/v4)",
+    )
+    comment_parser.add_argument("--project", help="owner/repo on GitHub; group/project or numeric id on GitLab")
+    comment_parser.add_argument("--number", help="Pull request number or merge request IID")
+    comment_parser.add_argument("--token-env", help="Environment variable that holds the token")
+    comment_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print where the comment would go and what it says, without posting",
+    )
 
     # validate command
     subparsers.add_parser("validate", help="Statically validate the config without running")
@@ -802,11 +986,24 @@ def _add_storage_args(parser: argparse.ArgumentParser) -> None:
 def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rules", help="Path to rules JSON file")
     parser.add_argument("--fail-on", choices=["WARNING", "DEGRADATION"], help="Exit code 1 threshold")
+    parser.add_argument(
+        "--warning-exit-code", type=int, metavar="CODE",
+        help="Exit with CODE instead of 0 when the worst result is WARNING "
+             "(e.g. 2 for GitLab allow_failure:exit_codes or Jenkins UNSTABLE)",
+    )
 
 
 def _add_report_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--title", help="Report title")
     parser.add_argument("--output", help="Report output path")
+    parser.add_argument(
+        "--summary", metavar="PATH",
+        help="Also write a markdown summary (pull/merge request comment, job summary)",
+    )
+    parser.add_argument(
+        "--junit", metavar="PATH",
+        help="Also write every check as JUnit XML (GitLab MR widget, Jenkins junit step)",
+    )
 
 
 # ── error reporting ───────────────────────────────────────────────────
@@ -852,6 +1049,9 @@ def _run_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     # init writes a config; it is the one command that must not need one.
     if args.command == "init":
         return cmd_init(args)
+    # comment only needs the summary file and the environment.
+    if args.command == "comment":
+        return cmd_comment(args)
 
     try:
         config = load_config(args.config)

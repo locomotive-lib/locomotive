@@ -285,7 +285,7 @@ class ReportRenderer:
             '  <meta charset="utf-8" />\n'
             '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'
             f"  <title>{title_safe}</title>\n"
-            '  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n'
+            f"{self._chart_js_tag()}"
             f"  <style>\n{self._build_css()}\n  </style>\n"
             "</head>\n"
             "<body>\n"
@@ -346,6 +346,8 @@ class ReportRenderer:
     .status-badge-large.nodata  { background: var(--nodata-bg); color: var(--nodata); }
     .meta { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
     .meta-ids { font-family: monospace; font-size: 12px; }
+    .meta a { color: inherit; }
+    .chart-fallback { color: var(--text-muted); font-size: 13px; margin: 0 0 8px; }
 
     .card {
       background: var(--card); border: 1px solid var(--line);
@@ -552,6 +554,7 @@ class ReportRenderer:
             f'        <div class="meta">\n'
             # The timezone name is config text and rides along in this string.
             f"          Generated at {html.escape(self.generated_at)}<br>\n"
+            f"{self._ci_line()}"
             f'          <span class="meta-ids">Run: {run_id} | Baseline: {baseline_id}'
             f"{self._topology_note()}</span>\n"
             f"        </div>\n"
@@ -578,6 +581,60 @@ class ReportRenderer:
         if generators < 2:
             return ""
         return f" | Load generators: {generators}"
+
+    def _ci_line(self) -> str:
+        """Branch, commit, pull request and build, when a CI recorded them."""
+        meta = self.run_meta.get("meta")
+        ci = meta.get("ci") if isinstance(meta, dict) else None
+        if not isinstance(ci, dict) or ci.get("provider") in (None, "local"):
+            return ""
+        parts: List[str] = []
+        if ci.get("branch"):
+            branch = str(ci["branch"])
+            if ci.get("target_branch"):
+                branch += f" → {ci['target_branch']}"
+            parts.append(html.escape(branch))
+        if ci.get("commit"):
+            parts.append(f'<span class="meta-ids">{html.escape(str(ci["commit"])[:12])}</span>')
+        if ci.get("change_id"):
+            prefix = "!" if ci.get("provider") == "gitlab" else "#"
+            parts.append(self._link(ci.get("change_url"), f"{prefix}{ci['change_id']}"))
+        if ci.get("build_url"):
+            parts.append(self._link(ci.get("build_url"), "Build"))
+        if not parts:
+            return ""
+        return "          " + " · ".join(parts) + "<br>\n"
+
+    @staticmethod
+    def _link(url: Any, label: str) -> str:
+        """An anchor for an http(s) URL, and the bare label for anything else.
+
+        The URLs come out of CI environment variables, and a ``javascript:``
+        one would otherwise be a link that runs code.
+        """
+        text = html.escape(label)
+        if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+            return text
+        return f'<a href="{html.escape(url, quote=True)}">{text}</a>'
+
+    def _chart_js_tag(self) -> str:
+        url = self.cfg.chart_js_url
+        if not url:
+            return ""
+        return f'  <script src="{html.escape(url, quote=True)}"></script>\n'
+
+    @staticmethod
+    def _chart_content(canvas_id: str) -> str:
+        # Shown until the script draws the chart. Where scripts never run —
+        # Jenkins serves published reports with a policy that blocks them —
+        # it stays, and says why the space is empty.
+        return (
+            '<div class="chart-container">'
+            '<p class="chart-fallback">This chart is drawn with JavaScript and Chart.js, '
+            "and they did not run here. Jenkins blocks scripts in published reports "
+            "unless a Resource Root URL is configured.</p>"
+            f'<canvas id="{canvas_id}"></canvas></div>'
+        )
 
     # ------------------------------------------------------------------
     # KPI cards
@@ -647,8 +704,7 @@ class ReportRenderer:
             return ""
         cards = []
         for name, cfg in enabled:
-            canvas = _chart_canvas_id(name)
-            content = f'<div class="chart-container"><canvas id="{canvas}"></canvas></div>'
+            content = self._chart_content(_chart_canvas_id(name))
             cards.append(self._card(html.escape(cfg.title or str(name)), content))
         return self._charts_grid(cards)
 
@@ -770,8 +826,7 @@ class ReportRenderer:
         cards: List[str] = []
         for metric in self.cfg.trends.metrics:
             label = METRIC_LABELS.get(metric, metric)
-            canvas_id = _trend_canvas_id(metric)
-            content = f'<div class="chart-container"><canvas id="{canvas_id}"></canvas></div>'
+            content = self._chart_content(_trend_canvas_id(metric))
             # `trends.metrics` is a list the user writes, and an unknown metric
             # is used as its own label — so this title is user text.
             cards.append(self._card(f"{html.escape(str(label))} — last {n} runs", content))
@@ -824,7 +879,15 @@ class ReportRenderer:
 
         if not parts:
             return ""
-        return "  <script>\n    " + "\n\n    ".join(parts) + "\n  </script>"
+        # Without Chart.js (blocked CDN, offline runner) the fallback notes stay
+        # and nothing throws; with it, they are removed before drawing.
+        return (
+            "  <script>\n"
+            "    if (typeof Chart !== 'undefined') {\n"
+            "    document.querySelectorAll('.chart-fallback').forEach(function (el) { el.remove(); });\n\n    "
+            + "\n\n    ".join(parts)
+            + "\n    }\n  </script>"
+        )
 
     def _chart_init(self, canvas_id: str, cfg: ChartConfig) -> str:
         has_right = any(ds.y_axis == "right" for ds in cfg.datasets)
