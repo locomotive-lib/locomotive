@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import __version__
 from .analyzer import analyze as analyze_metrics
 from .analyzer import load_rules, merge_results, sanity_results, topology_results
 from .ci import default_run_id, detect_ci
@@ -17,7 +18,7 @@ from .launcher import LocustLauncher, find_stats_history_csv, parse_locust_stats
 from .reporter import render_report, load_stats_history, load_endpoint_stats
 from .scenario import generate_locustfile
 from .storage import Storage
-from .template import generate_template, generate_github_workflow
+from .template import generate_github_workflow, generate_jenkinsfile, generate_template
 from .utils import write_text
 
 
@@ -549,6 +550,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             generate_github_workflow(workflow_path, config_name=output_path.name)
             print(f"Created: {workflow_path}")
+
+    if args.jenkinsfile:
+        jenkinsfile_path = Path("Jenkinsfile")
+        if jenkinsfile_path.exists() and not args.force:
+            print(f"Skipped: {jenkinsfile_path} already exists")
+        else:
+            generate_jenkinsfile(jenkinsfile_path, config_name=output_path.as_posix())
+            print(f"Created: {jenkinsfile_path}")
     
     print()
     print("Next steps:")
@@ -851,6 +860,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Locomotive - CI/CD load testing runner and regression analyzer for Locust",
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to config JSON/YAML")
+    parser.add_argument("--version", action="version", version=f"locomotive {__version__}")
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -865,6 +875,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--openapi", help="Path to OpenAPI spec to generate request templates")
     init_parser.add_argument("--host", help="Default host URL")
     init_parser.add_argument("--github-workflow", action="store_true", help="Also generate GitHub Actions workflow")
+    init_parser.add_argument(
+        "--jenkinsfile", action="store_true",
+        help="Also generate a Jenkinsfile that uses the Locomotive shared library",
+    )
     init_parser.add_argument("--force", "-f", action="store_true", help="Overwrite existing files")
 
     # run command

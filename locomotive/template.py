@@ -224,6 +224,53 @@ def generate_rules_template(output_path: Path) -> None:
     output_path.write_text(json.dumps(rules, indent=2), encoding="utf-8")
 
 
+def generate_jenkinsfile(
+    output_path: Path,
+    config_name: str = "loconfig.json",
+    version: Optional[str] = None,
+) -> None:
+    """Generate a Jenkinsfile that runs the load test with the shared library.
+
+    The library tag and the CLI it installs are both pinned to the Locomotive
+    release that wrote the file: the step passes flags that only exist from
+    that release on. The library is loaded without an administrator.
+    """
+    from . import __version__
+
+    release = version or __version__
+    jenkinsfile = f"""// Load test with Locomotive.
+// Options: https://github.com/locomotive-lib/locomotive/blob/master/jenkins/README.md
+library identifier: 'locomotive@v{release}',
+        retriever: modernSCM(
+            scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
+            libraryPath: 'jenkins/')
+
+pipeline {{
+    agent any
+
+    options {{
+        // Lets pull request builds copy the baseline from their target branch.
+        // Replace my-app with this multibranch project's full name.
+        copyArtifactPermission('my-app/*')
+    }}
+
+    stages {{
+        // TODO: start the service under test before this stage.
+
+        stage('Load test') {{
+            steps {{
+                // Add commentCredentialsId: '<Secret text credential id>' to
+                // comment on pull requests.
+                locomotiveLoadTest(config: '{config_name}', locomotiveVersion: '{release}')
+            }}
+        }}
+    }}
+}}
+"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(jenkinsfile, encoding="utf-8")
+
+
 def generate_github_workflow(output_path: Path, config_name: str = "loconfig.json") -> None:
     """Generate a GitHub Actions workflow template.
 

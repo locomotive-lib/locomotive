@@ -1,0 +1,43 @@
+// Load test on every branch and pull request of a Multibranch Pipeline.
+//
+// The library is loaded straight from GitHub, so no Jenkins administrator is
+// needed. Pin the tag to the Locomotive version you use.
+library identifier: 'locomotive@v0.3.0',
+        retriever: modernSCM(
+            scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
+            libraryPath: 'jenkins/')
+
+pipeline {
+    agent any
+
+    options {
+        // Pull request builds copy the baseline from their target branch's
+        // last successful build, and the Copy Artifact plugin only allows that
+        // when the branch being copied from says so. Use your multibranch
+        // project's full name.
+        copyArtifactPermission('my-app/*')
+    }
+
+    stages {
+        stage('Start the service') {
+            steps {
+                sh 'docker compose up -d'
+            }
+        }
+
+        stage('Load test') {
+            steps {
+                // commentCredentialsId names a Secret text credential with a
+                // GitHub or GitLab token; leave it out to skip the comment.
+                locomotiveLoadTest(config: 'loconfig.json',
+                                   commentCredentialsId: 'locomotive-pr-comments')
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker compose down || true'
+        }
+    }
+}

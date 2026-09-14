@@ -52,6 +52,7 @@ loco init --github-workflow
 | `--host URL` | Service URL. Without it, the host declared by the spec's `servers`/`host` is used, falling back to `http://localhost:8000` |
 | `--output FILE` / `-o` | Output file path (default: `loconfig.json`) |
 | `--github-workflow` | Also create `.github/workflows/loadtest.yml` |
+| `--jenkinsfile` | Also create a `Jenkinsfile` that uses the [Jenkins shared library](jenkins/README.md) |
 | `--force` / `-f` | Overwrite existing files |
 
 ### 2. Configure
@@ -1047,6 +1048,36 @@ Action outputs:
 | `summary_path` | Path to the markdown summary |
 | `junit_path` | Path to JUnit XML with one test case per check — for test reporter actions |
 
+## Jenkins
+
+Locomotive ships a Pipeline shared library in [`jenkins/`](jenkins/README.md)
+with one step, `locomotiveLoadTest`. It takes the baseline from the last
+successful build of the branch being compared with (Copy Artifact), archives the
+runs for the next build, publishes JUnit results and the HTML report, turns
+`WARNING` into UNSTABLE and a degradation into FAILURE, and comments on
+pull/merge requests. Only branch builds record a baseline.
+
+```groovy
+library identifier: 'locomotive@v0.3.0',
+        retriever: modernSCM(
+            scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
+            libraryPath: 'jenkins/')
+
+pipeline {
+    agent any
+    options { copyArtifactPermission('my-app/*') }   // lets PR builds read the target branch's baseline
+    stages {
+        stage('Load test') {
+            steps { locomotiveLoadTest(config: 'loconfig.json') }
+        }
+    }
+}
+```
+
+`loco init --jenkinsfile` writes this file pinned to your Locomotive version. The
+options, required plugins, permissions and how to see the report's charts on
+Jenkins are in [jenkins/README.md](jenkins/README.md).
+
 ## Report Customization
 
 The `report` section in the config lets you customize the HTML report: theme, colors, branding, KPI cards, charts, endpoint table, and trends.
@@ -1304,7 +1335,7 @@ Available trend metrics: `rps`, `avg_ms`, `median_ms`, `p95_ms`, `p99_ms`, `max_
 ### `loco init` — create config
 
 ```bash
-loco init [--openapi spec.json] [--host URL] [--github-workflow] [--output FILE] [--force]
+loco init [--openapi spec.json] [--host URL] [--github-workflow] [--jenkinsfile] [--output FILE] [--force]
 ```
 
 | Flag | Description |
@@ -1313,6 +1344,7 @@ loco init [--openapi spec.json] [--host URL] [--github-workflow] [--output FILE]
 | `--host URL` | Service URL. Without it, the host declared by the spec's `servers`/`host` is used, falling back to `http://localhost:8000` |
 | `--output FILE` / `-o` | Output config path (default: `loconfig.json`) |
 | `--github-workflow` | Also create `.github/workflows/loadtest.yml` |
+| `--jenkinsfile` | Also create a `Jenkinsfile` that uses the [Jenkins shared library](jenkins/README.md) |
 | `--force` / `-f` | Overwrite existing files |
 
 ### `loco validate` — check the config
