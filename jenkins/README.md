@@ -68,7 +68,7 @@ for instances that do not allow shared libraries.
 ## Requirements
 
 - A **Unix agent** with Python 3.9+ (`loco` is installed into a virtualenv in the
-  workspace unless it is already on `PATH`).
+  workspace unless the library's version of it is already on `PATH`).
 - Plugins: Pipeline, **Copy Artifact** (baseline), **JUnit** (per-check results),
   **HTML Publisher** (report), Credentials Binding (comments). JUnit, HTML
   Publisher and Copy Artifact are optional: without one, the step says what is
@@ -92,6 +92,15 @@ where `my-app` is the multibranch project's full name, and must have built once
 with that setting. Until then a pull request build warns that it has no baseline
 and runs only the absolute thresholds.
 
+The copy takes the last *successful* build, whether or not that build archived
+anything: if the load test stage can be skipped on a branch (a `when`
+condition, say), the next build finds no baseline in it. Keep the step
+unconditional on the branches that record baselines.
+
+The step runs `loco` with `--warning-exit-code 3` and maps `3` to UNSTABLE.
+Not `2`: that is what a command line tool exits with for a mistyped argument,
+so a typo in `args` is a FAILURE that says so, not a warning.
+
 ## Options
 
 | Option | Default | Description |
@@ -105,8 +114,8 @@ and runs only the absolute thresholds.
 | `setBaseline` | branch builds only | `true`/`false` to force recording (or not) a passing run as the baseline |
 | `copyBaseline` | `true` | Copy the baseline from earlier builds |
 | `fallbackBranches` | `['main', 'master']` | Branches tried when the compared branch has no baseline |
-| `install` | `'auto'` | `'auto'`: use `loco` from `PATH`, otherwise install it; `true`: always install into `.loco-venv`; `false`: never install |
-| `locomotiveVersion` | latest | Version to install from PyPI |
+| `install` | `'auto'` | `'auto'`: use `loco` from `PATH` if it is the right version, otherwise install that version into `.loco-venv`; `true`: always install; `false`: never install, only warn about a different version |
+| `locomotiveVersion` | the library's own | Locomotive version to run and install from PyPI. Defaults to the library's tag, because the step passes flags that arrived with that release |
 | `python` | `'python3'` | Python used to create the virtualenv |
 | `failOnDegradation` | `true` | `false` marks a failed load test UNSTABLE instead of FAILURE — useful while piloting |
 | `junit` | `true` | Publish JUnit results |

@@ -7,7 +7,7 @@ pipeline {
     agent any
 
     options {
-        // Use your multibranch project's full name; see jenkins/README.md.
+        // Use your job's full name, or the multibranch project's with /*; see jenkins/README.md.
         copyArtifactPermission('my-app/*')
     }
 
@@ -20,10 +20,19 @@ pipeline {
                 dir('.loco-results') { deleteDir() }
 
                 script {
-                    // Compare with the target branch on a pull request, with this branch otherwise.
-                    String compared = env.CHANGE_TARGET ?: env.BRANCH_NAME
-                    // Multibranch escapes '/' in branch job names.
-                    String job = compared.replace('%', '%25').replace('/', '%2F')
+                    String job
+                    if (env.BRANCH_NAME) {
+                        // Multibranch: compare with the target branch on a pull
+                        // request, with this branch otherwise. Branch jobs are named
+                        // with these seven characters escaped, '%' first.
+                        String compared = env.CHANGE_TARGET ?: env.BRANCH_NAME
+                        job = compared.replace('%', '%25').replace('/', '%2F').replace('#', '%23')
+                                      .replace('?', '%3F').replace('[', '%5B').replace(']', '%5D')
+                                      .replace('\\', '%5C')
+                    } else {
+                        // A plain pipeline job: its own last successful build.
+                        job = "/${env.JOB_NAME}"
+                    }
                     copyArtifacts(projectName: job, selector: lastSuccessful(),
                                   filter: '.loco/**', optional: true)
                     if (!fileExists('.loco/baseline.json')) {
@@ -31,9 +40,10 @@ pipeline {
                     }
                 }
 
+                // Pinned: the flags below arrived with this release.
                 sh '''
                     python3 -m venv .loco-venv
-                    .loco-venv/bin/python -m pip install --quiet --upgrade locomotive
+                    .loco-venv/bin/python -m pip install --quiet 'locomotive==0.3.0'
                 '''
 
                 script {
@@ -41,7 +51,7 @@ pipeline {
                     String setBaseline = env.CHANGE_ID ? '' : '--set-baseline'
                     env.LOCO_EXIT_CODE = sh(returnStatus: true, script: """
                         .loco-venv/bin/loco --config loconfig.json ci ${setBaseline} \\
-                            --storage .loco --prune --warning-exit-code 2 \\
+                            --storage .loco --prune --warning-exit-code 3 \\
                             --summary .loco-results/summary.md \\
                             --junit .loco-results/junit.xml \\
                             --output .loco-results/report.html
@@ -64,8 +74,8 @@ pipeline {
         stage('Verdict') {
             steps {
                 script {
-                    // 0 pass, 2 warning, anything else a failure.
-                    if (env.LOCO_EXIT_CODE == '2') {
+                    // 0 pass, 3 warning (not 2: a mistyped command line exits 2), anything else a failure.
+                    if (env.LOCO_EXIT_CODE == '3') {
                         unstable('Load test: WARNING')
                     } else if (env.LOCO_EXIT_CODE != '0') {
                         error("Load test failed (exit code ${env.LOCO_EXIT_CODE})")

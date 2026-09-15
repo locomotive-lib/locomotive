@@ -48,7 +48,7 @@ def call(Map config = [:]) {
                  '--summary', "${results}/summary.md",
                  '--junit', "${results}/junit.xml",
                  '--output', "${results}/report.html",
-                 '--warning-exit-code', '2']
+                 '--warning-exit-code', '3']
     if (setBaseline) {
         args.add('--set-baseline')
     }
@@ -170,24 +170,44 @@ String baselineHint() {
     return 'On the first build of a branch that is expected.'
 }
 
+// The CLI must be the release the library was written for: the flags this
+// step passes arrived with it, and an older `loco` fails on them with nothing
+// but a usage message. A `loco` already on the agent is used only when it is
+// that version; otherwise that version is installed into the workspace.
 String resolveLoco(Map opts) {
+    String wanted = opts.locomotiveVersion ? opts.locomotiveVersion.toString() : libraryVersion()
     boolean onPath = sh(script: 'command -v loco >/dev/null 2>&1', returnStatus: true) == 0
-    boolean install = opts.install == true || (opts.install == 'auto' && (!onPath || opts.locomotiveVersion))
-    if (!install) {
+    String found = onPath ? sh(script: 'loco --version 2>/dev/null || true', returnStdout: true).trim() : ''
+    boolean matches = found == "locomotive ${wanted}".toString()
+
+    if (opts.install == false) {
         if (!onPath) {
-            error("`loco` is not on this agent's PATH. Install locomotive on the agent, or use install: true")
+            error("`loco` is not on this agent's PATH. Install locomotive ${wanted} on the agent, or use install: true")
+        }
+        if (!matches) {
+            echo "WARNING: this step is written for locomotive ${wanted}; the agent has ${found ?: 'an older loco'}"
         }
         return 'loco'
     }
+    if (opts.install == 'auto' && matches) {
+        return 'loco'
+    }
+    if (onPath && !matches) {
+        echo "The agent's loco (${found ?: 'older than 0.3.0'}) is not locomotive ${wanted}: installing ${wanted} into .loco-venv"
+    }
     String venv = "${env.WORKSPACE}/.loco-venv"
-    String pkg = opts.locomotiveVersion ? "locomotive==${opts.locomotiveVersion}" : 'locomotive'
     sh """
         set -e
         ${quote(opts.python)} -m venv ${quote(venv)}
         ${quote(venv + '/bin/python')} -m pip install --quiet --upgrade pip
-        ${quote(venv + '/bin/python')} -m pip install --quiet --upgrade ${quote(pkg)}
+        ${quote(venv + '/bin/python')} -m pip install --quiet ${quote('locomotive==' + wanted)}
     """
     return quote(venv + '/bin/loco')
+}
+
+String libraryVersion() {
+    // Kept equal to locomotive/__init__.py by tests/test_jenkins_library.py.
+    return '0.3.0'
 }
 
 def publishResults(Map opts) {
@@ -241,7 +261,9 @@ def postComment(Map opts, String loco) {
 }
 
 Map verdict(Map opts, int code) {
-    String status = code == 0 ? 'PASS' : (code == 2 ? 'WARNING' : 'FAILED')
+    // loco runs with --warning-exit-code 3. Not 2: that is also what a mistyped
+    // command line exits with, and a typo in `args` must not pass for a warning.
+    String status = code == 0 ? 'PASS' : (code == 3 ? 'WARNING' : 'FAILED')
     String line = "Load test: ${status}"
     currentBuild.description = currentBuild.description ? "${currentBuild.description}\n${line}" : line
 
@@ -252,11 +274,11 @@ Map verdict(Map opts, int code) {
         junit   : "${opts.resultsDir}/junit.xml",
         report  : "${opts.resultsDir}/report.html",
     ]
-    if (code == 2) {
+    if (code == 3) {
         unstable("Load test: WARNING. A metric crossed its warn threshold; see ${opts.reportName}.")
     } else if (code != 0) {
-        String message = "Load test failed (loco exit code ${code}): a degradation, missing data, " +
-                         "or a run that could not start. See the console output and ${opts.reportName}."
+        String cause = (code == 2) ? 'loco refused its command line, so check the args option' : 'a degradation, missing data, a failed Locust run, or a run that could not start'
+        String message = "Load test failed (loco exit code ${code}): ${cause}. See the console output and ${opts.reportName}."
         if (code == 1 && !opts.failOnDegradation) {
             unstable(message)
         } else {

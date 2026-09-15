@@ -113,6 +113,29 @@ def test_init_keeps_an_existing_jenkinsfile(tmp_path, monkeypatch, capsys):
     assert "Skipped: Jenkinsfile already exists" in capsys.readouterr().out
 
 
+def test_the_step_knows_its_release():
+    # The step installs, and checks for, the CLI of its own release by default.
+    match = re.search(r"String libraryVersion\(\) \{.*?return '([^']+)'", STEP.read_text(encoding="utf-8"), re.S)
+    assert match and match.group(1) == __version__
+
+
+def test_the_example_pins_the_cli_it_was_written_for():
+    example = ROOT / "jenkins" / "examples" / "Jenkinsfile.without-library"
+    assert f"locomotive=={__version__}" in example.read_text(encoding="utf-8")
+
+
+def test_warnings_exit_3_and_turn_the_build_unstable():
+    # 2 is argparse's exit code for a mistyped command line.
+    step = code_only(STEP.read_text(encoding="utf-8"))
+    assert "'--warning-exit-code', '3'" in step
+    assert "code == 3 ? 'WARNING'" in step
+    assert "if (code == 3) {" in step
+
+    example = code_only((ROOT / "jenkins" / "examples" / "Jenkinsfile.without-library").read_text(encoding="utf-8"))
+    assert "--warning-exit-code 3" in example
+    assert "env.LOCO_EXIT_CODE == '3'" in example
+
+
 def test_version_flag(capsys):
     # The step logs `loco --version` so a build shows which CLI judged it.
     with pytest.raises(SystemExit) as exit_info:
