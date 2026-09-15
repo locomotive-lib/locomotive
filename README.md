@@ -887,7 +887,7 @@ recorded in `run.json` and shown in the report header, and the default run id is
 |------|----------------|-------------------|
 | `--summary summary.md` | Markdown: status, metrics against the baseline, every check worst-first | Pull/merge request comment via `loco comment`; `$GITHUB_STEP_SUMMARY` |
 | `--junit junit.xml` | One test case per rule, gate threshold and sanity check | GitLab merge request test widget; Jenkins `junit` step (and GitHub Checks through it) |
-| `--warning-exit-code 2` | Exit code `2` instead of `0` when the worst result is `WARNING` | GitLab `allow_failure: exit_codes: [2]` (orange job); Jenkins `unstable()` |
+| `--warning-exit-code 3` | Exit code `3` instead of `0` when the worst result is `WARNING` | GitLab `allow_failure: exit_codes: [3]` (orange job); Jenkins `unstable()` |
 | `--prune` (`ci` only) | Deletes stored runs other than this one and the baseline | Keeps the archived artifact directory — the next build's baseline source — small |
 
 In the JUnit file `DEGRADATION` and `NO_DATA` are failures, `SKIP` is skipped,
@@ -895,6 +895,13 @@ and `WARNING` is a failure only under `fail_on: "WARNING"` — otherwise it pass
 and says so in its output. The file describes the checks; the exit code decides
 the build. `--summary` and `--junit` also work on `loco report`, for artifacts an
 earlier step produced.
+
+Use `3` rather than `2` for the warning exit code: `2` is what command line tools,
+`loco` included, exit with when an argument is mistyped, and a typo would then
+pass for a warning. Locust's own exit code counts as well: it exits `1` as soon as
+any request failed (its `--exit-code-on-error` default) or the run broke, which
+fails the build even when every threshold passes — the summary and the JUnit file
+show that as a failed `locust_exit_code` check rather than a green result.
 
 ### `loco comment` — one comment per pull/merge request
 

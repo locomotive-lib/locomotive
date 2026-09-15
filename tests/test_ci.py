@@ -355,6 +355,27 @@ class TestAnalyzeTheBaselineItself:
         assert "baseline_id" not in analysis
         assert all(r["metric"] != "p95_ms" for r in analysis["results"])
 
+    def test_analyze_and_report_follow_a_run_recorded_under_a_new_id(self, tmp_path, monkeypatch):
+        # The separate-steps workflow: `run` renames the colliding run to
+        # local-2, and `analyze`/`report` with the same config must find it.
+        config = {
+            "artifacts": {"storage": str(tmp_path / "artifacts"), "run_id": "local"},
+            "load": {"locustfile": "dummy.py"},
+            "analysis": {"rules": [P95_RULE]},
+        }
+        storage = Storage.from_root(tmp_path / "artifacts")
+        monkeypatch.setattr(cli, "_run", FakeLauncher(metrics(100)))
+        cli.cmd_run(make_args(), config)
+        monkeypatch.setattr(cli, "_run", FakeLauncher(metrics(400)))
+        cli.cmd_run(make_args(set_baseline=False), config)
+
+        assert cli.cmd_analyze(make_args(), config) == 1
+        analysis = json.loads(storage.analysis_path("local-2").read_text())
+        assert analysis["baseline_id"] == "local"
+
+        cli.cmd_report(make_args(), config)
+        assert storage.report_path("local-2").exists()
+
     def test_without_a_gate_there_is_nothing_to_analyze(self, tmp_path):
         storage = Storage.from_root(tmp_path / "artifacts")
         storage.ensure_run("base")

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from . import __version__
 from .analyzer import analyze as analyze_metrics
-from .analyzer import load_rules, merge_results, sanity_results, topology_results
+from .analyzer import load_rules, merge_results, no_data_result, sanity_results, topology_results
 from .ci import default_run_id, detect_ci
 from .config import load_config, load_config_raw
 from .gate import evaluate_gate, summarize_history
@@ -151,6 +151,45 @@ def _avoid_baseline_collision(storage: Storage, run_id: str, baseline_id: Option
         "Remove artifacts.run_id from the config to get a unique id per CI build."
     )
     return fresh
+
+
+def _renamed_run(storage: Storage, run_id: str) -> Optional[str]:
+    """The newest run `_avoid_baseline_collision` recorded in place of *run_id*.
+
+    `loco run` records a colliding run as <id>-2, <id>-3, ..., but a separate
+    `loco analyze` or `loco report` with the same constant id resolves the
+    baseline again instead of the run it is meant to look at.
+    """
+    found = None
+    suffix = 2
+    while storage.run_dir(f"{run_id}-{suffix}").exists():
+        if storage.metrics_path(f"{run_id}-{suffix}").exists():
+            found = f"{run_id}-{suffix}"
+        suffix += 1
+    return found
+
+
+def _rules_configured(args: argparse.Namespace, analysis_cfg: Dict[str, Any]) -> bool:
+    return bool(getattr(args, "rules", None) or analysis_cfg.get("rules_file") or analysis_cfg.get("rules"))
+
+
+def _missing_baseline_results(
+    storage: Storage, baseline_id: Optional[str], rules_configured: bool
+) -> List[Dict[str, Any]]:
+    """A named baseline without metrics: a comparison that failed, not one skipped.
+
+    Every rule against it comes out SKIP, which reads like a first run. But a
+    baseline that was named — by --baseline, analysis.baseline or baseline.json
+    — and then pruned, not downloaded or mistyped is no first run, and the
+    regression it was there to catch used to pass with exit code 0.
+    """
+    if not baseline_id or not rules_configured or storage.metrics_path(baseline_id).exists():
+        return []
+    return [no_data_result(
+        "baseline",
+        f"baseline run '{baseline_id}' has no metrics.json in {storage.runs_dir()}: "
+        "it was pruned, not downloaded, or the id is wrong",
+    )]
 
 
 def _build_locust_config(args: argparse.Namespace, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,8 +398,13 @@ def _write_exports(
     baseline_id: Optional[str],
     analysis_cfg: Dict[str, Any],
     title: str,
+    locust_exit_code: Optional[int] = None,
 ) -> None:
-    """Write the markdown summary and JUnit XML asked for on the command line."""
+    """Write the markdown summary and JUnit XML asked for on the command line.
+
+    *locust_exit_code* is Locust's own exit code. It fails the build by itself,
+    so the files have to show it, or they say PASS about a red build.
+    """
     summary_path = getattr(args, "summary", None)
     junit_path = getattr(args, "junit", None)
     if not summary_path and not junit_path:
@@ -374,9 +418,6 @@ def _write_exports(
     analysis = load(storage.analysis_path(run_id))
     if summary_path:
         baseline_metrics = load(storage.metrics_path(baseline_id)) if baseline_id else None
-        rules_configured = bool(
-            getattr(args, "rules", None) or analysis_cfg.get("rules_file") or analysis_cfg.get("rules")
-        )
         write_text(Path(summary_path), render_markdown_summary(
             run_id=run_id,
             metrics=metrics,
@@ -385,23 +426,27 @@ def _write_exports(
             baseline_metrics=baseline_metrics,
             run_meta=_load_run_meta(storage, run_id),
             endpoints=load_endpoint_rows(storage.raw_dir(run_id) / "locust_stats.csv"),
-            rules_configured=rules_configured,
+            rules_configured=_rules_configured(args, analysis_cfg),
+            locust_exit_code=locust_exit_code,
             title=title,
         ))
     if junit_path:
         fail_on = _resolve_fail_on(getattr(args, "fail_on", None), analysis_cfg)
         write_text(Path(junit_path), render_junit(
             run_id=run_id, metrics=metrics, analysis=analysis, fail_on=fail_on,
+            locust_exit_code=locust_exit_code,
         ))
 
 
-def _prune_runs(storage: Storage, run_id: str) -> None:
+def _prune_runs(storage: Storage, run_id: str, baseline_id: Optional[str] = None) -> None:
     """Keep only this run and the baseline, so the stored artifact stays small.
 
     The artifacts directory is what a CI system archives and hands to the next
     build as its baseline, and every run left in it is carried forward again.
+    Both baselines stay: the one baseline.json names now, and the one this run
+    was compared with, which --baseline or analysis.baseline may have named.
     """
-    keep = {run_id, storage.get_baseline()}
+    keep = {run_id, storage.get_baseline(), baseline_id}
     removed = storage.prune_runs(keep)
     if removed:
         kept = ", ".join(sorted(k for k in keep if k))
@@ -452,6 +497,11 @@ def _resolve_warning_exit_code(args_value: Any, analysis_cfg: Dict[str, Any]) ->
     code = _parse_int(raw, "warning_exit_code")
     if code is None or not 0 <= code <= 255:
         raise ValueError(f"warning_exit_code must be an integer from 0 to 255, got {raw!r}")
+    if code == 2:
+        print(
+            "Warning: warning_exit_code 2 is also what a mistyped command line exits with, "
+            "so a typo would pass for a warning. Use 3."
+        )
     return code
 
 
@@ -605,9 +655,14 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     mode, gate_cfg = _resolve_gate_config(analysis_cfg)
     baseline_id = _resolve_baseline_id(args, config, storage)
     if baseline_id and baseline_id == run_id:
-        # Comparing a run with itself proves nothing and passes every rule.
-        print(f"Warning: run '{run_id}' is the baseline itself; skipping the baseline comparison.")
-        baseline_id = None
+        renamed = _renamed_run(storage, run_id)
+        if renamed:
+            print(f"Run id '{run_id}' is the baseline; analyzing '{renamed}', the run recorded in its place.")
+            run_id = renamed
+        else:
+            # Comparing a run with itself proves nothing and passes every rule.
+            print(f"Warning: run '{run_id}' is the baseline itself; skipping the baseline comparison.")
+            baseline_id = None
     if not baseline_id and not mode:
         raise ValueError("baseline run id is required")
 
@@ -621,6 +676,9 @@ def cmd_analyze(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     if baseline_id:
         baseline_results = _analyze(storage, run_id, baseline_id, rules_path, inline_rules, save=False)
         result_sets.append(baseline_results.get("results") or [])
+        missing = _missing_baseline_results(storage, baseline_id, _rules_configured(args, analysis_cfg))
+        if missing:
+            result_sets.append(missing)
 
     gate_eval = None
     if mode:
@@ -672,14 +730,20 @@ def cmd_report(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     report_cfg = _get_section(config, "report")
     baseline_id = _resolve_baseline_id(args, config, storage)
     if baseline_id == run_id:
-        baseline_id = None
+        renamed = _renamed_run(storage, run_id)
+        if renamed:
+            print(f"Run id '{run_id}' is the baseline; reporting on '{renamed}', the run recorded in its place.")
+            run_id = renamed
+        else:
+            baseline_id = None
     title = args.title or report_cfg.get("title") or "CI Load Test Report"
     output_path = args.output or report_cfg.get("output")
 
     history_runs = storage.load_history().get("runs", [])
     _report(storage, run_id, baseline_id, title, output_path,
             report_cfg=report_cfg, history_runs=history_runs)
-    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title)
+    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title,
+                   locust_exit_code=_load_run_meta(storage, run_id).get("returncode"))
     return 0
 
 
@@ -697,6 +761,9 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     # Resolved before the run, which must not be written over the baseline.
     # The run itself never moves baseline.json, so this stays the baseline.
     baseline_id = _resolve_baseline_id(args, config, storage)
+    # A baseline named by --baseline or analysis.baseline, which --prune must
+    # not delete: baseline.json does not point at it, so nothing else keeps it.
+    requested_baseline = args.baseline or _get_section(config, "analysis").get("baseline")
     run_id = _avoid_baseline_collision(storage, _build_run_id(args, config), baseline_id)
     locust_config = _build_locust_config(args, config)
 
@@ -728,6 +795,9 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
         inline_rules = analysis_cfg.get("rules")
         baseline_results = _analyze(storage, run_id, baseline_id, rules_path, inline_rules, save=False)
         result_sets.append(baseline_results.get("results") or [])
+        missing = _missing_baseline_results(storage, baseline_id, _rules_configured(args, analysis_cfg))
+        if missing:
+            result_sets.append(missing)
     else:
         baseline_id = None
 
@@ -757,6 +827,10 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     if _is_true(analysis_cfg.get("allow_no_data")):
         _downgrade_no_data(result_sets)
 
+    locust_code = int(run_result.get("returncode") or 0)
+    rules_advisory = _is_true(analysis_cfg.get("rules_advisory"))
+    sanity_failed = any(res.get("status") == "NO_DATA" for res in sanity)
+
     if result_sets:
         combined = merge_results(result_sets)
         combined["run_id"] = run_id
@@ -764,13 +838,15 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
             combined["baseline_id"] = baseline_id
         if gate_eval:
             combined["gate"] = gate_eval.get("gate")
+        if rules_advisory and gate_eval:
+            # Regression rules are reported but only the gate (plus sanity
+            # checks) decides the exit code. Recorded, so the summary and the
+            # pull request comment say what the exit code says.
+            combined["verdict"] = "NO_DATA" if sanity_failed else _gate_status(gate_eval)
         storage.save_json(storage.analysis_path(run_id), combined)
         analysis = combined
 
-    locust_code = int(run_result.get("returncode") or 0)
-    rules_advisory = _is_true(analysis_cfg.get("rules_advisory"))
     set_baseline = False
-    sanity_failed = any(res.get("status") == "NO_DATA" for res in sanity)
     if args.set_baseline and metrics_exist and not sanity_failed:
         if gate_eval:
             # When gate is configured, use gate status for baseline eligibility.
@@ -797,9 +873,10 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     output_path = args.output or report_cfg.get("output")
     _report(storage, run_id, baseline_id, title, output_path,
             report_cfg=report_cfg, history_runs=history_runs)
-    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title)
+    _write_exports(args, storage, run_id, baseline_id, analysis_cfg, title,
+                   locust_exit_code=locust_code)
     if getattr(args, "prune", False):
-        _prune_runs(storage, run_id)
+        _prune_runs(storage, run_id, requested_baseline)
 
     if not metrics_exist:
         return locust_code or 1
@@ -808,12 +885,9 @@ def cmd_ci(args: argparse.Namespace, config: Dict[str, Any]) -> int:
     status = None
     if analysis:
         fail_on = _resolve_fail_on(args.fail_on, analysis_cfg)
-        if rules_advisory and gate_eval:
-            # Opt-in legacy behaviour: baseline regression rules are reported
-            # but only the gate (plus sanity checks) decides the exit code.
-            status = _gate_status(gate_eval)
-            if sanity_failed:
-                status = "NO_DATA"
+        if analysis.get("verdict"):
+            # rules_advisory: the gate (plus sanity checks) decides; see above.
+            status = analysis["verdict"]
         else:
             # Default: everything that was evaluated counts. 'loco ci' and
             # 'loco analyze' now agree on the same artifacts.
@@ -1012,7 +1086,8 @@ def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--warning-exit-code", type=int, metavar="CODE",
         help="Exit with CODE instead of 0 when the worst result is WARNING "
-             "(e.g. 2 for GitLab allow_failure:exit_codes or Jenkins UNSTABLE)",
+             "(e.g. 3 for GitLab allow_failure:exit_codes or Jenkins UNSTABLE; "
+             "not 2, which a mistyped command line exits with too)",
     )
 
 

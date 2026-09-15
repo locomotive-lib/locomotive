@@ -28,14 +28,15 @@ STATUS_ICONS = {
     "PASS": "✅",
     "WARNING": "⚠️",
     "DEGRADATION": "❌",
+    "FAILED": "❌",
     "NO_DATA": "⛔",
     "SKIP": "⏭️",
 }
 
 # Worst first: nobody should have to scroll to find what failed.
-_STATUS_ORDER = {"DEGRADATION": 0, "NO_DATA": 1, "WARNING": 2, "SKIP": 3, "PASS": 4}
+_STATUS_ORDER = {"FAILED": 0, "DEGRADATION": 0, "NO_DATA": 1, "WARNING": 2, "SKIP": 3, "PASS": 4}
 
-_TRIPPED = ("DEGRADATION", "NO_DATA", "WARNING")
+_TRIPPED = ("FAILED", "DEGRADATION", "NO_DATA", "WARNING")
 _MAX_TRIPPED = 3
 _MAX_ENDPOINT_ROWS = 50
 
@@ -58,12 +59,52 @@ def _fmt(value: Any) -> str:
     return f"{num:.2f}"
 
 
-def overall_status(metrics: Optional[Dict[str, Any]], analysis: Optional[Dict[str, Any]]) -> str:
-    if analysis and analysis.get("status"):
-        return str(analysis["status"])
-    # No analysis and no metrics is a run that measured nothing; no analysis
-    # with metrics is a run nothing was configured to judge.
-    return "PASS" if metrics else "NO_DATA"
+def locust_exit_result(code: Any) -> Optional[Dict[str, Any]]:
+    """Locust's own exit code as a failed check, when it is not 0.
+
+    The build fails on that code even when every threshold passes: Locust exits
+    1 as soon as any request failed (its --exit-code-on-error default), and
+    non-zero when the run broke. Without this check the summary and the JUnit
+    file said PASS about a red build.
+    """
+    if code is None or isinstance(code, bool):
+        return None
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return None
+    if value == 1:
+        reason = "Locust exited with 1: any failed request does that, and so does a run that broke"
+    else:
+        reason = f"Locust exited with {value}"
+    return {
+        "metric": "locust_exit_code", "mode": "run", "direction": "increase",
+        "warn": None, "fail": None, "current": None, "baseline": None,
+        "delta_percent": None, "status": "FAILED", "reason": reason,
+    }
+
+
+def overall_status(
+    metrics: Optional[Dict[str, Any]],
+    analysis: Optional[Dict[str, Any]],
+    locust_exit_code: Any = None,
+) -> str:
+    """The status the build ends with, as the exit code decides it.
+
+    ``verdict`` is set when regression rules are advisory and the gate decides.
+    """
+    analysis = analysis or {}
+    if analysis.get("verdict") or analysis.get("status"):
+        status = str(analysis.get("verdict") or analysis["status"])
+    else:
+        # No analysis and no metrics is a run that measured nothing; no
+        # analysis with metrics is a run nothing was configured to judge.
+        status = "PASS" if metrics else "NO_DATA"
+    if locust_exit_result(locust_exit_code) and status in ("PASS", "WARNING", "SKIP"):
+        return "FAILED"
+    return status
 
 
 def check_label(result: Dict[str, Any]) -> str:
@@ -123,6 +164,14 @@ def describe_result(result: Dict[str, Any]) -> str:
     if result.get("reason"):
         parts.append(str(result["reason"]))
     return "; ".join(parts)
+
+
+def _checks(analysis: Optional[Dict[str, Any]], locust_exit_code: Any) -> List[Dict[str, Any]]:
+    results = list((analysis or {}).get("results") or [])
+    run_check = locust_exit_result(locust_exit_code)
+    if run_check:
+        results.append(run_check)
+    return results
 
 
 def load_endpoint_rows(stats_path: Path) -> List[Dict[str, str]]:
@@ -207,6 +256,7 @@ def render_markdown_summary(
     run_meta: Optional[Dict[str, Any]] = None,
     endpoints: Optional[List[Dict[str, str]]] = None,
     rules_configured: bool = True,
+    locust_exit_code: Any = None,
     title: str = "Load test",
 ) -> str:
     """A pull/merge request comment or job summary for one run.
@@ -216,7 +266,7 @@ def render_markdown_summary(
     a comparison someone asked for.
     """
     metrics = metrics or {}
-    status = overall_status(metrics, analysis)
+    status = overall_status(metrics, analysis, locust_exit_code)
     compare = bool(baseline_id and baseline_metrics)
     # A run that compared nothing is not the same green as one that compared
     # and passed, and the heading is the only line many people read.
@@ -246,6 +296,14 @@ def render_markdown_summary(
             context.append(build)
     lines.append(" · ".join(context))
 
+    recorded, verdict = (analysis or {}).get("status"), (analysis or {}).get("verdict")
+    if verdict and recorded and verdict != recorded:
+        lines += [
+            "",
+            f"Regression rules are advisory here (`rules_advisory`): they came out {recorded}, "
+            "and only the gate decides the build.",
+        ]
+
     if not metrics:
         lines += [
             "",
@@ -253,7 +311,7 @@ def render_markdown_summary(
         ]
         return "\n".join(lines) + "\n"
 
-    results = list((analysis or {}).get("results") or [])
+    results = _checks(analysis, locust_exit_code)
     results.sort(key=lambda r: _STATUS_ORDER.get(str(r.get("status")), len(_STATUS_ORDER)))
 
     tripped = [r for r in results if r.get("status") in _TRIPPED]
@@ -307,7 +365,7 @@ def render_markdown_summary(
 
 
 def _is_failure(status: str, fail_on: str) -> bool:
-    if status in ("DEGRADATION", "NO_DATA"):
+    if status in ("FAILED", "DEGRADATION", "NO_DATA"):
         return True
     return status == "WARNING" and fail_on == "WARNING"
 
@@ -318,15 +376,18 @@ def render_junit(
     metrics: Optional[Dict[str, Any]],
     analysis: Optional[Dict[str, Any]],
     fail_on: str = "DEGRADATION",
+    locust_exit_code: Any = None,
 ) -> str:
     """Every check as a test case: failures are what would fail the build.
 
     A WARNING is a failure only under ``fail_on: WARNING``; otherwise it passes
     and says so in its output. Anything that fails a rule is still reported as
     a failure under ``rules_advisory`` — the file describes the checks, the
-    exit code decides the build.
+    exit code decides the build. A non-zero exit from Locust is a failed
+    ``locust_exit_code`` case, since it fails the build on its own.
     """
-    results = list((analysis or {}).get("results") or [])
+    analysis_results = list((analysis or {}).get("results") or [])
+    results = _checks(analysis, locust_exit_code)
     suites = ET.Element("testsuites", {"name": "locomotive"})
     suite = ET.SubElement(suites, "testsuite", {"name": "locomotive"})
     props = ET.SubElement(suite, "properties")
@@ -342,7 +403,7 @@ def render_junit(
         failure = ET.SubElement(tc, "failure", {"type": "NO_DATA", "message": "the run produced no metrics"})
         failure.text = "Locust wrote no statistics; the build log says why."
         failures += 1
-    elif not results:
+    elif not analysis_results:
         tc = case("locomotive.run", "checks")
         ET.SubElement(tc, "skipped", {"message": "no rules or gate thresholds configured"})
         skipped += 1

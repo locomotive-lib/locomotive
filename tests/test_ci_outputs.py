@@ -133,9 +133,18 @@ class TestValidateWarningExitCode:
         found = self.issues(value)
         assert found and found[0].level == ERROR
 
-    @pytest.mark.parametrize("value", [0, 2, 255])
+    @pytest.mark.parametrize("value", [0, 3, 255])
     def test_accepted(self, value):
         assert self.issues(value) == []
+
+    @pytest.mark.parametrize("value", [1, 2])
+    def test_codes_that_mean_something_else_are_warned_about(self, value):
+        found = self.issues(value)
+        assert found and found[0].level == WARNING
+
+    def test_the_cli_warns_about_2_as_well(self, capsys):
+        assert cli._resolve_warning_exit_code(2, {}) == 2
+        assert "Use 3" in capsys.readouterr().out
 
 
 # ── summary and JUnit ─────────────────────────────────────────────────
@@ -170,7 +179,10 @@ class TestExports:
                       summary=str(summary), junit=str(junit))
         assert code == 1
         assert "produced no metrics" in summary.read_text(encoding="utf-8")
-        assert ET.parse(junit).getroot().get("failures") == "1"
+        failed = [tc.get("name") for tc in ET.parse(junit).getroot().iter("testcase")
+                  if tc.find("failure") is not None]
+        # No metrics, and Locust's own exit code saying why.
+        assert failed == ["metrics", "locust_exit_code"]
 
 
 def test_first_run_summary_says_there_is_no_baseline(monkeypatch, config, tmp_path):
@@ -339,3 +351,90 @@ def test_validate_warns_about_a_non_string_chart_url():
     issues = [i for i in validate_config({"report": {"chart_js_url": 5}})
               if i.location == "report.chart_js_url"]
     assert issues and issues[0].level == WARNING
+
+
+# ── baselines that are named but not there ────────────────────────────
+
+
+class TestPruneKeepsTheComparedBaseline:
+    def test_an_explicit_baseline_survives_prune(self, monkeypatch, config, storage):
+        run_ci(monkeypatch, config, 100, run_id="golden")
+        config["analysis"]["baseline"] = "golden"
+
+        run_ci(monkeypatch, config, 100, run_id="r1", prune=True)
+
+        assert storage.metrics_path("golden").exists()
+        # ...so the next regression is still caught against it.
+        assert run_ci(monkeypatch, config, 400, run_id="r2", prune=True) == 1
+
+
+class TestMissingBaseline:
+    def test_a_named_baseline_without_metrics_fails_loudly(self, monkeypatch, config, storage):
+        config["analysis"]["baseline"] = "ghost"
+
+        assert run_ci(monkeypatch, config, 400, run_id="r") == 1
+
+        analysis = json.loads(storage.analysis_path("r").read_text())
+        check = next(r for r in analysis["results"] if r["metric"] == "baseline")
+        assert check["status"] == "NO_DATA"
+        assert "'ghost'" in check["reason"]
+
+    def test_it_does_not_matter_without_rules(self, monkeypatch, tmp_path):
+        config = {
+            "artifacts": {"storage": str(tmp_path / "artifacts")},
+            "load": {"locustfile": "dummy.py"},
+            "analysis": {"baseline": "ghost", "gate": {"thresholds": {"p95_ms": {"fail": 500}}}},
+        }
+        assert run_ci(monkeypatch, config, 100, run_id="r") == 0
+
+    def test_allow_no_data_opts_out(self, monkeypatch, config):
+        config["analysis"].update({"baseline": "ghost", "allow_no_data": True})
+        assert run_ci(monkeypatch, config, 100, run_id="r") == 0
+
+    def test_analyze_agrees(self, monkeypatch, config):
+        run_ci(monkeypatch, config, 100, run_id="r")
+        config["analysis"]["baseline"] = "ghost"
+        assert cli.cmd_analyze(make_args(run_id="r"), config) == 1
+
+
+# ── Locust's own exit code ────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("with_baseline")
+class TestLocustExitCode:
+    def test_summary_and_junit_agree_with_the_red_build(self, monkeypatch, config, tmp_path):
+        summary, junit = tmp_path / "summary.md", tmp_path / "junit.xml"
+
+        code = run_ci(monkeypatch, config, 101, returncode=1, run_id="r",
+                      summary=str(summary), junit=str(junit))
+
+        assert code == 1
+        text = summary.read_text(encoding="utf-8")
+        assert text.splitlines()[0] == "### ❌ CI Load Test Report: FAILED"
+        assert "locust_exit_code" in text
+        root = ET.parse(junit).getroot()
+        assert root.get("failures") == "1"
+        failed = [tc for tc in root.iter("testcase") if tc.find("failure") is not None]
+        assert [tc.get("name") for tc in failed] == ["locust_exit_code"]
+
+    def test_report_reads_it_from_run_json(self, monkeypatch, config, storage, tmp_path):
+        run_ci(monkeypatch, config, 100, run_id="r")
+        storage.save_json(storage.run_meta_path("r"), {"run_id": "r", "returncode": 1})
+        summary = tmp_path / "summary.md"
+
+        cli.cmd_report(make_args(run_id="r", summary=str(summary)), config)
+
+        assert summary.read_text(encoding="utf-8").splitlines()[0].endswith(": FAILED")
+
+
+def test_rules_advisory_summary_follows_the_gate(monkeypatch, config, tmp_path, with_baseline):
+    config["analysis"]["rules_advisory"] = True
+    config["analysis"]["gate"] = {"thresholds": {"p95_ms": {"fail": 5000}}}
+    summary = tmp_path / "summary.md"
+
+    assert run_ci(monkeypatch, config, 400, run_id="r", summary=str(summary)) == 0
+
+    text = summary.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == "### ✅ CI Load Test Report: PASS"
+    assert "advisory" in text
+    assert "p95_ms (relative): 400 vs 100" in text

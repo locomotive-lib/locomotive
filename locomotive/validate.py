@@ -593,6 +593,18 @@ def _validate_structure(config: Dict[str, Any], issues: List[Issue]) -> None:
                 ERROR, "analysis.warning_exit_code",
                 f"must be an integer from 0 to 255, got {code!r}",
             ))
+        elif int(code) == 1:
+            issues.append(Issue(
+                WARNING, "analysis.warning_exit_code",
+                "1 is the exit code of a failure, so a warning would fail the build; "
+                "use fail_on: WARNING if that is the intent",
+            ))
+        elif int(code) == 2:
+            issues.append(Issue(
+                WARNING, "analysis.warning_exit_code",
+                "2 is also what a mistyped command line exits with, so a typo would pass "
+                "for a warning; use 3",
+            ))
 
     report_section = config.get("report")
     if isinstance(report_section, dict) and "chart_js_url" in report_section:

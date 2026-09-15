@@ -2,6 +2,8 @@
 
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from locomotive.export import (
     describe_result,
     load_endpoint_rows,
@@ -139,6 +141,27 @@ class TestMarkdownSummary:
         odd = analysis(result("a|b", "PASS", mode="absolute", current=1.0))
         assert "a\\|b (absolute)" in summary(analysis=odd)
 
+    def test_a_failed_locust_run_is_not_a_pass(self):
+        clean = analysis(result("p95_ms", "PASS", current=100.0, baseline=100.0, delta_percent=0.0),
+                         status="PASS")
+        text = summary(analysis=clean, locust_exit_code=1)
+        assert text.splitlines()[0] == "### ❌ Load test: FAILED"
+        tripped = next(line for line in text.splitlines() if line.startswith("**What tripped:**"))
+        assert "locust_exit_code: Locust exited with 1" in tripped
+
+    def test_a_degradation_keeps_its_heading_when_locust_failed_too(self):
+        assert summary(locust_exit_code=1).splitlines()[0].endswith(": DEGRADATION")
+
+    @pytest.mark.parametrize("code", [0, None, "n/a"])
+    def test_a_clean_or_unknown_exit_adds_nothing(self, code):
+        assert "locust_exit_code" not in summary(locust_exit_code=code)
+
+    def test_the_heading_follows_an_advisory_verdict(self):
+        advisory = {"status": "DEGRADATION", "verdict": "PASS", "results": MIXED["results"]}
+        text = summary(analysis=advisory)
+        assert text.splitlines()[0] == "### ✅ Load test: PASS"
+        assert "advisory here (`rules_advisory`): they came out DEGRADATION" in text
+
 
 STATS_HEADER = "Type,Name,Request Count,Failure Count,Average Response Time,Requests/s,95%,99%\n"
 
@@ -225,6 +248,12 @@ class TestJunit:
         root = junit(analysis=None)
         assert root.find("testsuite").get("tests") == "1"
         assert cases(root)[("locomotive.run", "checks")].find("skipped") is not None
+
+    def test_a_failed_locust_run_is_a_failed_case(self):
+        root = junit(analysis=analysis(status="PASS"), locust_exit_code=3)
+        failure = cases(root)[("locomotive.run", "locust_exit_code")].find("failure")
+        assert "Locust exited with 3" in failure.get("message")
+        assert root.find("testsuite").get("failures") == "1"
 
     def test_markup_in_a_reason_is_escaped(self):
         odd = analysis(result("requests", "NO_DATA", mode="sanity", reason="<b>&</b>"))
