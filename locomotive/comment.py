@@ -3,7 +3,8 @@
 ``loco ci --summary summary.md`` writes the text and ``loco comment --body
 summary.md`` puts it on the change request the build belongs to. The next push
 edits that same comment instead of adding another — it is found again by a
-hidden marker — so a busy pull request does not collect one comment per push.
+hidden marker, in a comment the same token wrote — so a busy pull request does
+not collect one comment per push.
 
 The API spoken is the code host's, not the CI's: a Jenkins build of a GitHub
 pull request comments through GitHub. Only the standard library is used.
@@ -189,10 +190,23 @@ def _urllib_transport(
 
 
 class _Client:
+    # The field of `GET /user` that comments carry for their author.
+    identity_field = ""
+
     def __init__(self, target: Target, token: str, transport: Transport) -> None:
         self.target = target
         self.token = token
         self.transport = transport
+
+    def identity(self) -> Optional[str]:
+        """Who the token writes as, or None when the API will not say."""
+        status, data = self.transport("GET", f"{self.target.api_url}/user", self.headers(), None)
+        if 200 <= status < 300 and isinstance(data, dict) and data.get(self.identity_field):
+            return str(data[self.identity_field])
+        return None
+
+    def is_mine(self, comment: Dict[str, Any], me: Optional[str]) -> bool:
+        raise NotImplementedError
 
     def _call(self, method: str, url: str, payload: Optional[Dict[str, Any]], what: str) -> Any:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -231,6 +245,16 @@ class _Client:
 
 
 class _GitHub(_Client):
+    identity_field = "login"
+
+    def is_mine(self, comment: Dict[str, Any], me: Optional[str]) -> bool:
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        if me:
+            return user.get("login") == me
+        # GITHUB_TOKEN may not read /user. Its comments are the Actions bot's,
+        # and a person commenting on the pull request cannot post as a Bot.
+        return user.get("type") == "Bot"
+
     def _base(self) -> str:
         return f"{self.target.api_url}/repos/{self.target.project}/issues"
 
@@ -256,6 +280,14 @@ class _GitHub(_Client):
 
 
 class _GitLab(_Client):
+    identity_field = "username"
+
+    def is_mine(self, comment: Dict[str, Any], me: Optional[str]) -> bool:
+        author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+        # Without knowing who the token is, never edit a note: the marker could
+        # be in anyone's, and the token may not be allowed to edit it anyway.
+        return bool(me) and author.get("username") == me
+
     def _base(self) -> str:
         project = urllib.parse.quote(self.target.project, safe="")
         return f"{self.target.api_url}/projects/{project}/merge_requests/{self.target.number}/notes"
@@ -297,13 +329,19 @@ def upsert_comment(
     key: str = "loadtest",
     transport: Optional[Transport] = None,
 ) -> Tuple[str, Any]:
-    """Edit Locomotive's earlier comment for *key*, or create one."""
+    """Edit Locomotive's earlier comment for *key*, or create one.
+
+    Only a comment this token wrote counts. Anyone who can comment on the pull
+    request can paste the marker, and following it would write the results
+    into their comment, where they could later be edited to say anything.
+    """
     client_cls = _GitLab if target.host == GITLAB else _GitHub
     client = client_cls(target, token, transport or _urllib_transport)
     marker = marker_for(key)
     text = f"{marker}\n{_fit(body)}"
+    me = client.identity()
     for comment in client.comments():
-        if marker in str(comment.get("body") or ""):
+        if marker in str(comment.get("body") or "") and client.is_mine(comment, me):
             client.update(comment["id"], text)
             return "updated", comment["id"]
     created = client.create(text)

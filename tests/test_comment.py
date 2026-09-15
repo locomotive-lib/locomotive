@@ -5,6 +5,7 @@ import json
 import os
 import re
 import urllib.error
+from urllib.parse import urlparse
 
 import pytest
 
@@ -21,19 +22,31 @@ from locomotive.comment import (
     upsert_comment,
 )
 
+ACTIONS_BOT = {"login": "github-actions[bot]", "type": "Bot"}
+MARKED = marker_for("loadtest")
+
 
 class FakeHost:
-    """A code host API that records every request."""
+    """A code host API that records every request.
 
-    def __init__(self, comments=None, status=None):
+    *me* is what `GET /user` answers; None answers it the way GitHub answers a
+    GITHUB_TOKEN, with a 403.
+    """
+
+    def __init__(self, comments=None, status=None, me=None):
         self.comments = comments or []
         self.status = status
+        self.me = me
         self.requests = []
 
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, headers, json.loads(body) if body else None))
         if self.status:
             return self.status, {"message": "nope"}
+        if method == "GET" and urlparse(url).path.endswith("/user"):
+            if self.me is None:
+                return 403, {"message": "Resource not accessible by integration"}
+            return 200, self.me
         if method == "GET":
             page = int(re.search(r"[?&]page=(\d+)", url).group(1))
             return 200, self.comments[(page - 1) * 100: page * 100]
@@ -41,8 +54,11 @@ class FakeHost:
             return 201, {"id": 999}
         return 200, {"id": int(url.rstrip("/").split("/")[-1])}
 
-    def methods(self):
-        return [method for method, *_ in self.requests]
+    def writes(self):
+        return [(method, url) for method, url, *_ in self.requests if method != "GET"]
+
+    def listings(self):
+        return [url for method, url, *_ in self.requests if method == "GET" and "page=" in url]
 
 
 GITHUB_ENV = {
@@ -133,29 +149,29 @@ class TestUpsert:
         method, url, headers, body = host.requests[-1]
         assert method == "POST"
         assert url == "https://api.github.com/repos/org/app/issues/42/comments"
-        assert body["body"] == f"{marker_for('loadtest')}\nhello"
+        assert body["body"] == f"{MARKED}\nhello"
         assert headers["Authorization"] == "Bearer t"
 
     def test_updates_its_own_comment_even_on_a_later_page(self):
-        others = [{"id": n, "body": "someone else"} for n in range(100)]
-        mine = {"id": 555, "body": f"{marker_for('loadtest')}\nold"}
+        others = [{"id": n, "body": "someone else", "user": {"login": "dev", "type": "User"}} for n in range(100)]
+        mine = {"id": 555, "body": f"{MARKED}\nold", "user": ACTIONS_BOT}
         host = FakeHost(comments=others + [mine])
 
         action, comment_id = upsert_comment(GH, "t", "new", transport=host)
 
         assert (action, comment_id) == ("updated", 555)
-        assert host.methods() == ["GET", "GET", "PATCH"]
-        method, url, _, body = host.requests[-1]
-        assert url == "https://api.github.com/repos/org/app/issues/comments/555"
-        assert body["body"].endswith("\nnew")
+        assert len(host.listings()) == 2
+        assert host.writes() == [("PATCH", "https://api.github.com/repos/org/app/issues/comments/555")]
+        assert host.requests[-1][3]["body"].endswith("\nnew")
 
     def test_a_different_key_is_a_different_comment(self):
-        host = FakeHost(comments=[{"id": 1, "body": f"{marker_for('smoke')}\nx"}])
+        host = FakeHost(comments=[{"id": 1, "body": f"{marker_for('smoke')}\nx", "user": ACTIONS_BOT}])
         action, _ = upsert_comment(GH, "t", "y", key="soak", transport=host)
         assert action == "created"
 
     def test_gitlab_notes(self):
-        host = FakeHost(comments=[{"id": 77, "body": f"{marker_for('loadtest')}\nold"}])
+        bot = {"username": "project_321_bot"}
+        host = FakeHost(comments=[{"id": 77, "body": f"{MARKED}\nold", "author": bot}], me=bot)
         action, _ = upsert_comment(GL, "glpat", "new", transport=host)
 
         assert action == "updated"
@@ -168,7 +184,7 @@ class TestUpsert:
         host = FakeHost()
         upsert_comment(GH, "t", "x" * (MAX_BODY * 2), transport=host)
         body = host.requests[-1][3]["body"]
-        assert len(body) <= MAX_BODY + len(marker_for("loadtest")) + 1
+        assert len(body) <= MAX_BODY + len(MARKED) + 1
         assert "truncated" in body
 
     def test_permission_errors_carry_a_hint(self):
@@ -195,6 +211,45 @@ class TestUpsert:
 
         with pytest.raises(CommentError, match="did not return a JSON list"):
             upsert_comment(GH, "t", "x", transport=html_page)
+
+
+class TestOnlyItsOwnComment:
+    """Anyone who can comment can paste the marker; that must not be followed."""
+
+    def test_github_token_leaves_a_persons_marked_comment_alone(self):
+        planted = {"id": 1, "body": f"{MARKED}\nlooks official", "user": {"login": "mallory", "type": "User"}}
+        host = FakeHost(comments=[planted])
+
+        action, _ = upsert_comment(GH, "ghs_x", "results", transport=host)
+
+        assert action == "created"
+        assert host.writes() == [("POST", "https://api.github.com/repos/org/app/issues/42/comments")]
+
+    def test_a_personal_token_edits_only_the_comment_it_wrote(self):
+        planted = {"id": 1, "body": f"{MARKED}\nfake", "user": {"login": "mallory", "type": "User"}}
+        mine = {"id": 2, "body": f"{MARKED}\nold", "user": {"login": "perf-bot", "type": "User"}}
+        host = FakeHost(comments=[planted, mine], me={"login": "perf-bot"})
+
+        action, comment_id = upsert_comment(GH, "pat", "new", transport=host)
+
+        assert (action, comment_id) == ("updated", 2)
+
+    def test_gitlab_edits_only_the_token_users_note(self):
+        planted = {"id": 1, "body": f"{MARKED}\nfake", "author": {"username": "mallory"}}
+        mine = {"id": 2, "body": f"{MARKED}\nold", "author": {"username": "project_321_bot"}}
+        host = FakeHost(comments=[planted, mine], me={"username": "project_321_bot"})
+
+        action, comment_id = upsert_comment(GL, "glpat", "new", transport=host)
+
+        assert (action, comment_id) == ("updated", 2)
+
+    def test_gitlab_without_an_identity_never_edits(self):
+        planted = {"id": 1, "body": f"{MARKED}\nfake", "author": {"username": "mallory"}}
+        host = FakeHost(comments=[planted])
+
+        action, _ = upsert_comment(GL, "glpat", "new", transport=host)
+
+        assert action == "created"
 
 
 class TestPostComment:
