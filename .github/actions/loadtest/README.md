@@ -77,6 +77,12 @@ jobs:
   run: echo "Load test: ${{ steps.loadtest.outputs.status }}"
 ```
 
+## Requirements
+
+Python 3.9+ on the runner (add `actions/setup-python` before this action), and
+a self-hosted runner on **Actions Runner 2.327.1 or newer**: the actions this
+one uses run on Node 24, and an older runner fails those steps.
+
 ## Permissions and forks
 
 - `actions: read` lets the baseline be found among artifacts of earlier runs.
