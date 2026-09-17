@@ -72,7 +72,7 @@ runs:
           echo "Error: python3 not found!"
           echo "Please add 'Setup Python' step before using this action:"
           echo "  - name: Set up Python"
-          echo "    uses: actions/setup-python@v5"
+          echo "    uses: actions/setup-python@v7"
           echo "    with:"
           echo "      python-version: '3.12'"
           exit 1
@@ -98,7 +98,7 @@ runs:
 
     - name: Download baseline (branch)
       id: download-branch-baseline
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -128,7 +128,7 @@ runs:
     # и прогон рапортует PASS, ничего ни с чем не сравнив.
     - name: Retry baseline download (branch)
       if: steps.check-baseline.outputs.found != 'true'
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -154,7 +154,7 @@ runs:
 
     - name: Download baseline (fallback)
       if: steps.check-baseline-retry.outputs.found != 'true' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -263,7 +263,7 @@ runs:
     # прямо в интерфейсе Actions и открывается одним кликом из списка проверок.
     - name: Write job summary
       if: always()
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       with:
         script: |
           const fs = require('fs');
@@ -362,7 +362,7 @@ runs:
           await core.summary.addRaw(lines.join('\n')).write();
 
     - name: Upload results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       if: always()
       with:
         name: ${{ inputs.results_artifact }}-${{ github.run_id }}
@@ -395,7 +395,7 @@ runs:
 
     - name: Upload baseline
       if: inputs.set_baseline == 'true' && always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
@@ -403,7 +403,7 @@ runs:
 
     - name: Post PR comment
       if: github.event_name == 'pull_request' && inputs.post_pr_comment == 'true' && always()
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       with:
         script: |
           const fs = require('fs');

@@ -10,12 +10,12 @@ GitHub Action для запуска нагрузочного тестирова�
 
 ```yaml
 - name: Set up Python
-  uses: actions/setup-python@v5
+  uses: actions/setup-python@v7
   with:
     python-version: '3.13'
 
 - name: Checkout locomotive
-  uses: actions/checkout@v4
+  uses: actions/checkout@v7
   with:
     repository: YOUR_ORG/locomotive
     path: locomotive
@@ -34,12 +34,12 @@ GitHub Action для запуска нагрузочного тестирова�
 
 ```yaml
 - name: Set up Python
-  uses: actions/setup-python@v5
+  uses: actions/setup-python@v7
   with:
     python-version: '3.9'
 
 - name: Checkout locomotive
-  uses: actions/checkout@v4
+  uses: actions/checkout@v7
   with:
     repository: YOUR_ORG/locomotive
     path: locomotive
