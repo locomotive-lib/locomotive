@@ -43,14 +43,17 @@ pipeline {
                 // Pinned: the flags below arrived with this release.
                 sh '''
                     python3 -m venv .loco-venv
-                    .loco-venv/bin/python -m pip install --quiet 'locomotive==0.3.0'
+                    .loco-venv/bin/python -m pip install --quiet 'locomotive==0.3.1'
                 '''
 
                 script {
                     // Only branch builds may become the baseline, never pull requests.
                     String setBaseline = env.CHANGE_ID ? '' : '--set-baseline'
                     env.LOCO_EXIT_CODE = sh(returnStatus: true, script: """
-                        .loco-venv/bin/loco --config loconfig.json ci ${setBaseline} \\
+                        # On PATH, not by its full path: loco starts `locust`,
+                        # which lives in the same virtualenv.
+                        export PATH="\$PWD/.loco-venv/bin:\$PATH"
+                        loco --config loconfig.json ci ${setBaseline} \\
                             --storage .loco --prune --warning-exit-code 3 \\
                             --summary .loco-results/summary.md \\
                             --junit .loco-results/junit.xml \\

@@ -15,21 +15,21 @@ Locomotive load test and does the Jenkins side of it the Jenkins way:
   builds edit instead of adding new ones (GitHub, GitHub Enterprise, GitLab).
 
 The library lives in the `jenkins/` directory of the Locomotive repository and is
-tagged with it, so library `v0.3.0` goes with `locomotive` 0.3.0.
+tagged with it, so library `v0.3.1` goes with `locomotive` 0.3.1.
 
 ## Loading the library
 
 **Without an administrator** — at the top of the `Jenkinsfile`:
 
 ```groovy
-library identifier: 'locomotive@v0.3.0',
+library identifier: 'locomotive@v0.3.1',
         retriever: modernSCM(
             scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
             libraryPath: 'jenkins/')
 ```
 
 **As a Global (or folder) Pipeline Library** — in *Manage Jenkins → System →
-Global Trusted Pipeline Libraries*: name `locomotive`, default version `v0.3.0`,
+Global Trusted Pipeline Libraries*: name `locomotive`, default version `v0.3.1`,
 retrieval method *Modern SCM* → Git with
 `https://github.com/locomotive-lib/locomotive.git`, and **Library Path**
 `jenkins/`. Then:
