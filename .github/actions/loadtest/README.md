@@ -1,124 +1,92 @@
 # CI Load Test Action
 
-GitHub Action для запуска нагрузочного тестирования с использованием Locomotive.
+Runs a [Locomotive](../../../README.md) load test in GitHub Actions: downloads
+the branch-aware baseline, runs `loco ci`, writes the job summary, uploads the
+report and the baseline, and keeps one comment on the pull request up to date.
 
-## Использование
+The full documentation is in the main README, under
+[GitHub Actions](../../../README.md#github-actions); this page is the short
+reference.
 
-### Публичный репозиторий (проще всего)
-
-Если репозиторий публичный, токены не нужны:
-
-```yaml
-- name: Set up Python
-  uses: actions/setup-python@v7
-  with:
-    python-version: '3.13'
-
-- name: Checkout locomotive
-  uses: actions/checkout@v7
-  with:
-    repository: YOUR_ORG/locomotive
-    path: locomotive
-    ref: master  # или main, в зависимости от вашей default branch
-
-- name: Run load test
-  uses: ./locomotive/.github/actions/loadtest
-  with:
-    config: loconfig.json
-    lib_repo: YOUR_ORG/locomotive
-```
-
-### Приватный репозиторий
-
-Если репозиторий приватный, нужен токен `LOCOMOTIVE_TOKEN`:
+## Usage
 
 ```yaml
-- name: Set up Python
-  uses: actions/setup-python@v7
-  with:
-    python-version: '3.9'
+name: Load Test
 
-- name: Checkout locomotive
-  uses: actions/checkout@v7
-  with:
-    repository: YOUR_ORG/locomotive
-    path: locomotive
-    token: ${{ secrets.LOCOMOTIVE_TOKEN }}
-    ref: master  # или main, в зависимости от вашей default branch
+on:
+  push:
+    branches: [main]
+  pull_request:
 
-- name: Run load test
-  uses: ./locomotive/.github/actions/loadtest
-  with:
-    config: loconfig.json
-    lib_repo: YOUR_ORG/locomotive
-    lib_token: ${{ secrets.LOCOMOTIVE_TOKEN }}
+permissions:
+  contents: read
+  actions: read          # find the baseline artifact from earlier runs
+  pull-requests: write   # post the results comment and keep it updated
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # start the service under test here
+
+      - name: Run load test
+        id: loadtest
+        uses: locomotive-lib/locomotive/.github/actions/loadtest@master
+        with:
+          config: loconfig.json
 ```
 
-### Полный пример с параметрами
-
-```yaml
-- name: Run load test
-  uses: ./locomotive/.github/actions/loadtest
-  with:
-    config: loconfig.json
-    lib_repo: YOUR_ORG/locomotive
-    lib_token: ${{ secrets.LOCOMOTIVE_TOKEN }}  # только для приватных репо
-    users: 50
-    run_time: 2m
-    set_baseline: false
-    baseline_artifact: loadtest-baseline
-    results_artifact: loadtest-results
-```
+`loco init --github-workflow` generates this workflow.
 
 ## Inputs
 
-| Параметр | Описание | Обязательный | По умолчанию |
-|----------|----------|--------------|--------------|
-| `config` | Путь к конфигу loconfig.json | Нет | `loconfig.json` |
-| `lib_repo` | Репозиторий библиотеки (owner/repo) | Да | - |
-| `lib_token` | GitHub токен для доступа к приватному репо (только для приватных репо) | Нет | `github.token` |
-| `users` | Количество пользователей (переопределяет конфиг) | Нет | - |
-| `run_time` | Время выполнения теста (переопределяет конфиг) | Нет | - |
-| `set_baseline` | Установить этот запуск как baseline | Нет | `false` |
-| `baseline_artifact` | Имя артефакта для baseline | Нет | `loadtest-baseline` |
-| `results_artifact` | Имя артефакта для результатов | Нет | `loadtest-results` |
+| Input | Default | Description |
+|-------|---------|-------------|
+| `config` | `loconfig.json` | Path to the Locomotive config |
+| `users` | from config | Override the number of users |
+| `run_time` | from config | Override the run time, e.g. `2m` |
+| `args` | (empty) | Extra arguments for `loco ci`, e.g. `--processes 4` |
+| `set_baseline` | `true` | Record a passing run as the baseline and upload it |
+| `post_pr_comment` | `true` | Post the summary on the pull request, editing the same comment on later pushes |
+| `baseline_artifact` | `loadtest-baseline` | Name of the baseline artifact |
+| `results_artifact` | `loadtest-results` | Name prefix of the results artifact |
+| `workflow` | (empty) | Workflow file to search for baseline artifacts (empty = all workflows) |
+| `fallback_branch` | default branch | Branch whose baseline is used when the compared branch has none |
+| `github_token` | `github.token` | Token for baseline downloads and the comment |
+| `locomotive_version` | (empty) | Install this version from PyPI instead of the one shipped with the action |
 
 ## Outputs
 
-| Параметр | Описание |
-|----------|----------|
-| `metrics_path` | Путь к файлу metrics.json |
-| `report_path` | Путь к файлу report.html |
-| `status` | Статус теста (PASS/WARNING/DEGRADATION) |
-
-## Пример использования outputs
+| Output | Description |
+|--------|-------------|
+| `status` | `PASS`, `WARNING`, `DEGRADATION` or `NO_DATA` |
+| `metrics_path` | Path to `metrics.json` |
+| `report_path` | Path to `report.html` |
+| `summary_path` | Path to the markdown summary |
+| `junit_path` | Path to JUnit XML with one test case per check |
 
 ```yaml
-- name: Run load test
-  id: loadtest
-  uses: ./locomotive/.github/actions/loadtest
-  with:
-    config: loconfig.json
-    lib_repo: YOUR_ORG/locomotive
-    lib_token: ${{ secrets.LOCOMOTIVE_TOKEN }}
-
-- name: Check status
-  run: |
-    echo "Status: ${{ steps.loadtest.outputs.status }}"
-    echo "Metrics: ${{ steps.loadtest.outputs.metrics_path }}"
-    echo "Report: ${{ steps.loadtest.outputs.report_path }}"
+- name: Show the verdict
+  if: always()
+  run: echo "Load test: ${{ steps.loadtest.outputs.status }}"
 ```
 
-## Что делает action
+## Requirements
 
-1. Устанавливает зависимости (locust, PyYAML)
-2. Устанавливает Locomotive из указанного репозитория
-3. Скачивает baseline артефакты (если есть)
-4. Запускает нагрузочный тест
-5. Загружает результаты в артефакты
+Python 3.9+ on the runner (add `actions/setup-python` before this action), and
+a self-hosted runner on **Actions Runner 2.327.1 or newer**: the actions this
+one uses run on Node 24, and an older runner fails those steps.
 
-## Требования
+## Permissions and forks
 
-- Python 3.9+
-- Конфиг `loconfig.json` в репозитории
-- Для приватных репозиториев: секрет `LOCOMOTIVE_TOKEN` с PAT токеном (см. инструкции в основном README)
+- `actions: read` lets the baseline be found among artifacts of earlier runs.
+- `pull-requests: write` lets the comment be posted and updated.
+
+A pull request from a fork gets a read-only `GITHUB_TOKEN`. The comment step
+then fails without failing the job; the job summary still has the results.

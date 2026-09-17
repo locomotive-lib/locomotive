@@ -69,8 +69,7 @@
     ]
   },
   "artifacts": {
-    "storage": "artifacts",
-    "run_id": "${GITHUB_SHA:-local}"
+    "storage": "artifacts"
   },
   "analysis": {
     "mode": "resilience",

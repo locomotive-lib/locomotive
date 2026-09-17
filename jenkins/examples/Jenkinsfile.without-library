@@ -1,0 +1,87 @@
+// The same load test without the shared library, for Jenkins instances that
+// do not allow loading one. It needs the Copy Artifact, JUnit and HTML
+// Publisher plugins; locomotiveLoadTest does more (fallback branches, missing
+// plugins, pull request comments, options), so prefer it where you can.
+
+pipeline {
+    agent any
+
+    options {
+        // Use your job's full name, or the multibranch project's with /*; see jenkins/README.md.
+        copyArtifactPermission('my-app/*')
+    }
+
+    stages {
+        stage('Load test') {
+            steps {
+                // A workspace outlives the build on the same agent: a leftover
+                // directory would pass for this build's baseline.
+                dir('.loco') { deleteDir() }
+                dir('.loco-results') { deleteDir() }
+
+                script {
+                    String job
+                    if (env.BRANCH_NAME) {
+                        // Multibranch: compare with the target branch on a pull
+                        // request, with this branch otherwise. Branch jobs are named
+                        // with these seven characters escaped, '%' first.
+                        String compared = env.CHANGE_TARGET ?: env.BRANCH_NAME
+                        job = compared.replace('%', '%25').replace('/', '%2F').replace('#', '%23')
+                                      .replace('?', '%3F').replace('[', '%5B').replace(']', '%5D')
+                                      .replace('\\', '%5C')
+                    } else {
+                        // A plain pipeline job: its own last successful build.
+                        job = "/${env.JOB_NAME}"
+                    }
+                    copyArtifacts(projectName: job, selector: lastSuccessful(),
+                                  filter: '.loco/**', optional: true)
+                    if (!fileExists('.loco/baseline.json')) {
+                        echo 'WARNING: no baseline found; regression rules will be skipped.'
+                    }
+                }
+
+                // Pinned: the flags below arrived with this release.
+                sh '''
+                    python3 -m venv .loco-venv
+                    .loco-venv/bin/python -m pip install --quiet 'locomotive==0.3.0'
+                '''
+
+                script {
+                    // Only branch builds may become the baseline, never pull requests.
+                    String setBaseline = env.CHANGE_ID ? '' : '--set-baseline'
+                    env.LOCO_EXIT_CODE = sh(returnStatus: true, script: """
+                        .loco-venv/bin/loco --config loconfig.json ci ${setBaseline} \\
+                            --storage .loco --prune --warning-exit-code 3 \\
+                            --summary .loco-results/summary.md \\
+                            --junit .loco-results/junit.xml \\
+                            --output .loco-results/report.html
+                    """).toString()
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: '.loco/**, .loco-results/**', excludes: '**/__pycache__/**',
+                                     allowEmptyArchive: true
+                    junit testResults: '.loco-results/junit.xml', allowEmptyResults: true,
+                          skipMarkingBuildUnstable: true
+                    publishHTML(target: [reportName: 'Load test report', reportDir: '.loco-results',
+                                         reportFiles: 'report.html', keepAll: true,
+                                         alwaysLinkToLastBuild: true, allowMissing: true])
+                }
+            }
+        }
+
+        stage('Verdict') {
+            steps {
+                script {
+                    // 0 pass, 3 warning (not 2: a mistyped command line exits 2), anything else a failure.
+                    if (env.LOCO_EXIT_CODE == '3') {
+                        unstable('Load test: WARNING')
+                    } else if (env.LOCO_EXIT_CODE != '0') {
+                        error("Load test failed (exit code ${env.LOCO_EXIT_CODE})")
+                    }
+                }
+            }
+        }
+    }
+}

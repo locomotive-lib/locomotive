@@ -584,6 +584,35 @@ def _validate_structure(config: Dict[str, Any], issues: List[Issue]) -> None:
                 f"unknown value {analysis['fail_on']!r}; expected one of "
                 f"{', '.join(_FAIL_ON_LEVELS)} — DEGRADATION is used instead",
             ))
+    if isinstance(analysis, dict) and analysis.get("warning_exit_code") is not None:
+        code = analysis["warning_exit_code"]
+        # Read after the run has finished, so a bad value would end `loco ci`
+        # with an error once the load test had already spent its minutes.
+        if isinstance(code, bool) or not _is_int(code) or not 0 <= int(code) <= 255:
+            issues.append(Issue(
+                ERROR, "analysis.warning_exit_code",
+                f"must be an integer from 0 to 255, got {code!r}",
+            ))
+        elif int(code) == 1:
+            issues.append(Issue(
+                WARNING, "analysis.warning_exit_code",
+                "1 is the exit code of a failure, so a warning would fail the build; "
+                "use fail_on: WARNING if that is the intent",
+            ))
+        elif int(code) == 2:
+            issues.append(Issue(
+                WARNING, "analysis.warning_exit_code",
+                "2 is also what a mistyped command line exits with, so a typo would pass "
+                "for a warning; use 3",
+            ))
+
+    report_section = config.get("report")
+    if isinstance(report_section, dict) and "chart_js_url" in report_section:
+        if not isinstance(report_section["chart_js_url"], str):
+            issues.append(Issue(
+                WARNING, "report.chart_js_url",
+                f"must be a URL string, got {report_section['chart_js_url']!r} — the default is used",
+            ))
 
     artifacts = config.get("artifacts")
     if isinstance(artifacts, dict) and artifacts.get("history") is not None:

@@ -1,5 +1,5 @@
 name: 'CI Load Test'
-description: 'Run load tests using Locomotive library (pip install locomotive)'
+description: 'Load test with Locomotive: branch-aware baseline, job summary, JUnit results and a pull request comment'
 
 inputs:
   config:
@@ -15,8 +15,13 @@ inputs:
     description: 'Override run time (e.g., 30s, 1m)'
     required: false
 
+  args:
+    description: 'Extra arguments for `loco ci`, e.g. "--processes 4 --tags smoke"'
+    required: false
+    default: ''
+
   set_baseline:
-    description: 'Set this run as baseline and upload artifact'
+    description: 'Record a passing run as the baseline and upload it for later runs'
     required: false
     default: 'true'
 
@@ -31,7 +36,7 @@ inputs:
     default: 'loadtest-results'
 
   post_pr_comment:
-    description: 'Post results as comment to PR'
+    description: 'Post the summary on the pull request, editing the same comment on every push'
     required: false
     default: 'true'
 
@@ -41,13 +46,18 @@ inputs:
     default: ''
 
   fallback_branch:
-    description: 'Fallback branch for baseline when no branch-specific baseline exists'
+    description: 'Branch whose baseline is used when the compared branch has none (empty = the repository default branch)'
     required: false
-    default: 'main'
+    default: ''
 
   github_token:
-    description: 'GitHub token for posting PR comments (uses github.token if not provided)'
+    description: 'Token for baseline downloads and the PR comment (uses github.token if not provided)'
     required: false
+
+  locomotive_version:
+    description: 'Install this Locomotive version from PyPI (empty = the version shipped with this action)'
+    required: false
+    default: ''
 
 outputs:
   metrics_path:
@@ -59,45 +69,61 @@ outputs:
     value: ${{ steps.run.outputs.report_path }}
 
   status:
-    description: 'Test status (PASS/WARNING/DEGRADATION)'
+    description: 'Run status: PASS, WARNING, DEGRADATION or NO_DATA'
     value: ${{ steps.run.outputs.status }}
 
+  summary_path:
+    description: 'Path to the markdown summary (the job summary and PR comment text)'
+    value: ${{ steps.run.outputs.summary_path }}
+
+  junit_path:
+    description: 'Path to JUnit XML with one test case per check, for test reporters'
+    value: ${{ steps.run.outputs.junit_path }}
+
+# Значения из контекстов (имена веток, inputs) передаются в скрипты только
+# через env: подставленные прямо в `run:`, они становятся частью скрипта, и
+# ветка с именем вида `$(curl ...)` выполнила бы свой код на раннере.
 runs:
   using: 'composite'
   steps:
-    - name: Install dependencies
+    - name: Install Locomotive
       shell: bash
+      env:
+        LOCOMOTIVE_VERSION: ${{ inputs.locomotive_version }}
       run: |
         if ! command -v python3 &> /dev/null; then
-          echo "Error: python3 not found!"
-          echo "Please add 'Setup Python' step before using this action:"
-          echo "  - name: Set up Python"
-          echo "    uses: actions/setup-python@v7"
-          echo "    with:"
-          echo "      python-version: '3.12'"
+          echo "::error title=python3 not found::Add actions/setup-python before this action"
           exit 1
         fi
 
         python3 -m pip install --quiet --upgrade pip
-        python3 -m pip install --quiet --upgrade locomotive locust
+        if [ -n "$LOCOMOTIVE_VERSION" ]; then
+          python3 -m pip install --quiet "locomotive==$LOCOMOTIVE_VERSION"
+        else
+          # Флаги, которые action передаёт в `loco`, появляются в том же коммите,
+          # что и сам action. Библиотека ставится оттуда же, а не с PyPI, где
+          # может лежать релиз, который этих флагов ещё не знает.
+          python3 -m pip install --quiet "$GITHUB_ACTION_PATH/../../.."
+        fi
 
         echo "Installed:"
-        python3 -m pip show locomotive | grep -E "Name|Version" || true
+        python3 -m pip show locomotive | grep -E "^(Name|Version):" || true
 
     - name: Resolve baseline branch
-      id: resolve-branch
+      id: branch
       shell: bash
+      env:
+        BASELINE_BRANCH: ${{ github.base_ref || github.ref_name }}
+        FALLBACK_BRANCH: ${{ inputs.fallback_branch || github.event.repository.default_branch || 'main' }}
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BRANCH="${{ github.event.pull_request.base.ref }}"
-        else
-          BRANCH="${{ github.ref_name }}"
-        fi
-        echo "baseline_branch=$BRANCH" >> $GITHUB_OUTPUT
-        echo "Resolved baseline branch: $BRANCH"
+        # Self-hosted раннер хранит workspace между запусками: оставшаяся
+        # папка сошла бы за скачанный baseline чужой ветки.
+        rm -rf loadtest-artifacts
+        echo "baseline=$BASELINE_BRANCH" >> "$GITHUB_OUTPUT"
+        echo "fallback=$FALLBACK_BRANCH" >> "$GITHUB_OUTPUT"
+        echo "Baseline branch: $BASELINE_BRANCH (fallback: $FALLBACK_BRANCH)"
 
     - name: Download baseline (branch)
-      id: download-branch-baseline
       uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
@@ -105,7 +131,7 @@ runs:
         workflow: ${{ inputs.workflow }}
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
-        branch: ${{ steps.resolve-branch.outputs.baseline_branch }}
+        branch: ${{ steps.branch.outputs.baseline }}
         workflow_conclusion: ""
         check_artifacts: true
         if_no_artifact_found: warn
@@ -115,10 +141,10 @@ runs:
       shell: bash
       run: |
         if [ -f "loadtest-artifacts/baseline.json" ]; then
-          echo "found=true" >> $GITHUB_OUTPUT
+          echo "found=true" >> "$GITHUB_OUTPUT"
           echo "Baseline found"
         else
-          echo "found=false" >> $GITHUB_OUTPUT
+          echo "found=false" >> "$GITHUB_OUTPUT"
           echo "No baseline on the first attempt"
         fi
 
@@ -135,7 +161,7 @@ runs:
         workflow: ${{ inputs.workflow }}
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
-        branch: ${{ steps.resolve-branch.outputs.baseline_branch }}
+        branch: ${{ steps.branch.outputs.baseline }}
         workflow_conclusion: ""
         check_artifacts: true
         if_no_artifact_found: warn
@@ -145,15 +171,15 @@ runs:
       shell: bash
       run: |
         if [ -f "loadtest-artifacts/baseline.json" ]; then
-          echo "found=true" >> $GITHUB_OUTPUT
+          echo "found=true" >> "$GITHUB_OUTPUT"
           echo "Baseline found"
         else
-          echo "found=false" >> $GITHUB_OUTPUT
+          echo "found=false" >> "$GITHUB_OUTPUT"
           echo "Still no baseline for this branch, will try the fallback branch"
         fi
 
     - name: Download baseline (fallback)
-      if: steps.check-baseline-retry.outputs.found != 'true' && steps.resolve-branch.outputs.baseline_branch != inputs.fallback_branch
+      if: steps.check-baseline-retry.outputs.found != 'true' && steps.branch.outputs.baseline != steps.branch.outputs.fallback
       uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
@@ -161,7 +187,7 @@ runs:
         workflow: ${{ inputs.workflow }}
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
-        branch: ${{ inputs.fallback_branch }}
+        branch: ${{ steps.branch.outputs.fallback }}
         workflow_conclusion: ""
         check_artifacts: true
         if_no_artifact_found: warn
@@ -178,220 +204,82 @@ runs:
         Only absolute thresholds will run, so a slowdown against the previous run cannot be caught."
         fi
 
-    - name: Sync storage path
-      shell: bash
-      run: |
-        STORAGE_DIR=$(python3 -c "
-        import json, os, re
-        cfg_path = '${{ inputs.config }}'
-        ext = os.path.splitext(cfg_path)[1].lower()
-        with open(cfg_path) as f:
-            if ext in ('.yml', '.yaml'):
-                import yaml; cfg = yaml.safe_load(f) or {}
-            else:
-                cfg = json.load(f)
-        raw = str(cfg.get('artifacts', {}).get('storage', 'loadtest-artifacts'))
-        resolved = re.sub(r'\\\$\{(\w+)(?::-([^}]*))?\}', lambda m: os.environ.get(m.group(1), m.group(2) or ''), raw)
-        print(resolved)
-        " 2>/dev/null || echo "loadtest-artifacts")
-
-        echo "Config storage: $STORAGE_DIR"
-
-        if [ "$STORAGE_DIR" != "loadtest-artifacts" ] && [ ! -e "$STORAGE_DIR" ]; then
-          ln -s "$(pwd)/loadtest-artifacts" "$STORAGE_DIR"
-          echo "Created symlink: $STORAGE_DIR -> loadtest-artifacts"
-        else
-          echo "Storage path matches download path"
-        fi
-
+    # Сводка, JUnit, подрезка хранилища до baseline и текущего прогона — всё
+    # это делает сам `loco`, одинаково для GitHub, GitLab и Jenkins.
     - name: Run load test
       id: run
       shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        USERS: ${{ inputs.users }}
+        RUN_TIME: ${{ inputs.run_time }}
+        SET_BASELINE: ${{ inputs.set_baseline }}
+        EXTRA_ARGS: ${{ inputs.args }}
       run: |
-        echo "=== Running Load Test ==="
+        out_dir="$RUNNER_TEMP/locomotive"
+        mkdir -p "$out_dir"
 
-        CMD="loco --config ${{ inputs.config }} ci"
+        args=(--config "$CONFIG" ci --storage loadtest-artifacts --prune
+              --summary "$out_dir/summary.md" --junit "$out_dir/junit.xml")
+        if [ -n "$USERS" ]; then args+=(--users "$USERS"); fi
+        if [ -n "$RUN_TIME" ]; then args+=(--run-time "$RUN_TIME"); fi
+        if [ "$SET_BASELINE" = "true" ]; then args+=(--set-baseline); fi
+        # Дополнительные аргументы намеренно разбиваются по пробелам.
+        # shellcheck disable=SC2206
+        if [ -n "$EXTRA_ARGS" ]; then args+=($EXTRA_ARGS); fi
 
-        if [ -n "${{ inputs.users }}" ]; then
-          CMD="$CMD --users ${{ inputs.users }}"
-        fi
-
-        if [ -n "${{ inputs.run_time }}" ]; then
-          CMD="$CMD --run-time ${{ inputs.run_time }}"
-        fi
-
-        if [ "${{ inputs.set_baseline }}" == "true" ]; then
-          CMD="$CMD --set-baseline"
-        fi
-
-        echo "Command: $CMD"
-        $CMD || EXIT_CODE=$?
-
+        echo "Command: loco ${args[*]}"
+        exit_code=0
+        loco "${args[@]}" || exit_code=$?
         echo ""
-        echo "=== Exit code: ${EXIT_CODE:-0} ==="
+        echo "=== Exit code: $exit_code ==="
 
-        ARTIFACTS_DIR="loadtest-artifacts/runs"
-        if [ -d "$ARTIFACTS_DIR" ]; then
-          RUN_DIR=$(ls -td "$ARTIFACTS_DIR"/*/ 2>/dev/null | head -1)
-          if [ -n "$RUN_DIR" ]; then
-            METRICS_PATH="$RUN_DIR/metrics.json"
-            REPORT_PATH="$RUN_DIR/report.html"
+        echo "summary_path=$out_dir/summary.md" >> "$GITHUB_OUTPUT"
+        echo "junit_path=$out_dir/junit.xml" >> "$GITHUB_OUTPUT"
 
-            if [ -f "$METRICS_PATH" ]; then
-              echo "metrics_path=$METRICS_PATH" >> $GITHUB_OUTPUT
-              echo "report_path=$REPORT_PATH" >> $GITHUB_OUTPUT
-
-              ANALYSIS_PATH="$RUN_DIR/analysis.json"
-              if [ -f "$ANALYSIS_PATH" ]; then
-                STATUS=$(python3 -c "import json; print(json.load(open('$ANALYSIS_PATH')).get('status', 'UNKNOWN'))" 2>/dev/null || echo "UNKNOWN")
-                echo "status=$STATUS" >> $GITHUB_OUTPUT
-              fi
-
-              echo ""
-              echo "=== Metrics ==="
-              cat "$METRICS_PATH" | python3 -m json.tool || cat "$METRICS_PATH"
-            fi
+        # После --prune в хранилище остаются baseline и этот прогон; этот новее.
+        run_dir=$(ls -td loadtest-artifacts/runs/*/ 2>/dev/null | head -1 || true)
+        status=NO_DATA
+        if [ -n "$run_dir" ] && [ -f "${run_dir}metrics.json" ]; then
+          echo "metrics_path=${run_dir}metrics.json" >> "$GITHUB_OUTPUT"
+          echo "report_path=${run_dir}report.html" >> "$GITHUB_OUTPUT"
+          status=PASS
+          if [ -f "${run_dir}analysis.json" ]; then
+            status=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status") or "PASS")' "${run_dir}analysis.json")
           fi
         fi
+        echo "status=$status" >> "$GITHUB_OUTPUT"
 
-        exit ${EXIT_CODE:-0}
-      env:
-        GITHUB_SHA: ${{ github.sha }}
+        # У GitHub нет «жёлтого» статуса job — WARNING виден хотя бы аннотацией.
+        if [ "$status" = "WARNING" ]; then
+          echo "::warning title=Load test: WARNING::A metric crossed its warn threshold; the job summary has the details."
+        fi
+
+        exit "$exit_code"
 
     # Отчёт лежит в артефакте, а артефакт надо скачать и распаковать — чтобы
     # посмотреть одно число, это слишком долго. Сводка прогона рендерится
     # прямо в интерфейсе Actions и открывается одним кликом из списка проверок.
     - name: Write job summary
       if: always()
-      uses: actions/github-script@v9
-      with:
-        script: |
-          const fs = require('fs');
-          const path = require('path');
-
-          const artifactsDir = 'loadtest-artifacts/runs';
-          if (!fs.existsSync(artifactsDir)) return;
-          const runs = fs.readdirSync(artifactsDir)
-            .map(run => path.join(artifactsDir, run))
-            .filter(run => fs.statSync(run).isDirectory())
-            .sort((a, b) => fs.statSync(b).mtime - fs.statSync(a).mtime);
-          if (runs.length === 0) return;
-
-          const runDir = runs[0];
-          const read = (file) => {
-            const full = path.join(runDir, file);
-            if (!fs.existsSync(full)) return null;
-            try { return JSON.parse(fs.readFileSync(full, 'utf8')); } catch { return null; }
-          };
-
-          const metrics = read('metrics.json');
-          if (!metrics) return;
-          const analysis = read('analysis.json') || {};
-          const num = (val, digits = 2) =>
-            typeof val === 'number' ? val.toFixed(digits) : (val == null ? '—' : String(val));
-
-          const statusText = {
-            PASS: 'Passed', WARNING: 'Warning', DEGRADATION: 'Degradation',
-          }[analysis.status] || (analysis.status || 'Done');
-
-          const lines = [`## Load test — ${statusText}`, ''];
-
-          // Заголовок: та метрика, которая решила исход, а не список из шести.
-          const results = Array.isArray(analysis.results) ? analysis.results : [];
-          const decisive = results.find(r => r && r.status === 'DEGRADATION')
-                        || results.find(r => r && r.status === 'WARNING');
-          if (decisive && decisive.delta_percent != null) {
-            const sign = decisive.delta_percent > 0 ? '+' : '';
-            lines.push(`**${decisive.metric}: ${num(decisive.current)} vs ${num(decisive.baseline)} `
-                       + `baseline (${sign}${decisive.delta_percent.toFixed(1)}%)**`, '');
-          }
-
-          if (results.length) {
-            lines.push('| Check | Baseline | Current | Change | Status |',
-                       '|---|---:|---:|---:|---|');
-            for (const res of results) {
-              const change = res.delta_percent == null
-                ? '—'
-                : `${res.delta_percent > 0 ? '+' : ''}${res.delta_percent.toFixed(1)}%`;
-              lines.push(`| ${res.metric} | ${num(res.baseline)} | ${num(res.current)} `
-                         + `| ${change} | ${res.status} |`);
-            }
-            lines.push('');
-          }
-
-          // Разбивка по эндпоинтам живёт только в CSV от locust.
-          const statsPath = path.join(runDir, 'raw', 'locust_stats.csv');
-          if (fs.existsSync(statsPath)) {
-            const parseRow = (line) => {
-              const cells = [];
-              let cur = '', quoted = false;
-              for (const ch of line) {
-                if (ch === '"') quoted = !quoted;
-                else if (ch === ',' && !quoted) { cells.push(cur); cur = ''; }
-                else cur += ch;
-              }
-              cells.push(cur);
-              return cells;
-            };
-            const rows = fs.readFileSync(statsPath, 'utf8').trim().split('\n').map(parseRow);
-            const header = rows.shift() || [];
-            const at = (row, name) => {
-              const idx = header.indexOf(name);
-              return idx === -1 ? null : row[idx];
-            };
-            if (rows.length) {
-              lines.push('### Endpoints', '',
-                         '| Endpoint | Requests | Failures | Avg | p95 | p99 | RPS |',
-                         '|---|---:|---:|---:|---:|---:|---:|');
-              for (const row of rows) {
-                const name = at(row, 'Name');
-                if (!name) continue;
-                const label = name.toLowerCase() === 'aggregated' ? '**Total**' : name;
-                lines.push(`| ${label} | ${at(row, 'Request Count')} | ${at(row, 'Failure Count')} `
-                           + `| ${num(parseFloat(at(row, 'Average Response Time')), 0)} `
-                           + `| ${at(row, '95%')} | ${at(row, '99%')} `
-                           + `| ${num(parseFloat(at(row, 'Requests/s')), 1)} |`);
-              }
-              lines.push('');
-            }
-          }
-
-          if (analysis.baseline_id) lines.push(`Compared against \`${analysis.baseline_id}\`.`, '');
-          lines.push('The HTML report with charts is in the artifacts of this run.');
-
-          await core.summary.addRaw(lines.join('\n')).write();
+      shell: bash
+      env:
+        SUMMARY: ${{ steps.run.outputs.summary_path }}
+      run: |
+        if [ -n "$SUMMARY" ] && [ -f "$SUMMARY" ]; then
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nThe HTML report with charts is in the artifacts of this run.\n' >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Upload results
-      uses: actions/upload-artifact@v7
+      id: results
       if: always()
+      uses: actions/upload-artifact@v7
       with:
-        name: ${{ inputs.results_artifact }}-${{ github.run_id }}
+        name: ${{ inputs.results_artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: loadtest-artifacts/
         retention-days: 30
-
-    - name: Trim old runs from baseline artifact
-      if: inputs.set_baseline == 'true'
-      shell: bash
-      run: |
-        BASELINE_FILE="loadtest-artifacts/baseline.json"
-        if [ ! -f "$BASELINE_FILE" ]; then
-          echo "No baseline.json found, skipping trim"
-          exit 0
-        fi
-        BASELINE_RUN=$(python3 -c "import json; print(json.load(open('$BASELINE_FILE')).get('run_id',''))" 2>/dev/null || echo "")
-        if [ -z "$BASELINE_RUN" ]; then
-          echo "Could not determine baseline run_id, skipping trim"
-          exit 0
-        fi
-        echo "Keeping only baseline run: $BASELINE_RUN"
-        for dir in loadtest-artifacts/runs/*/; do
-          [ -d "$dir" ] || continue
-          dir_name=$(basename "$dir")
-          if [ "$dir_name" != "$BASELINE_RUN" ]; then
-            echo "Removing old run: $dir_name"
-            rm -rf "$dir"
-          fi
-        done
+        if-no-files-found: warn
 
     - name: Upload baseline
       if: inputs.set_baseline == 'true' && always()
@@ -400,203 +288,28 @@ runs:
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
         retention-days: 90
+        overwrite: true
+        if-no-files-found: ignore
 
+    # Один комментарий на PR: следующий push правит его, а не добавляет новый.
+    # Ошибка комментария (например, read-only токен у PR из форка) не должна
+    # ронять проверку, результат которой уже есть в сводке.
     - name: Post PR comment
-      if: github.event_name == 'pull_request' && inputs.post_pr_comment == 'true' && always()
-      uses: actions/github-script@v9
-      with:
-        script: |
-          const fs = require('fs');
-          const path = require('path');
-
-          const artifactsDir = 'loadtest-artifacts/runs';
-          if (!fs.existsSync(artifactsDir)) {
-            console.log('No artifacts found, skipping comment');
-            return;
-          }
-
-          const runs = fs.readdirSync(artifactsDir)
-            .map(run => path.join(artifactsDir, run))
-            .filter(run => fs.statSync(run).isDirectory())
-            .sort((a, b) => fs.statSync(b).mtime - fs.statSync(a).mtime);
-
-          if (runs.length === 0) {
-            console.log('No runs found, skipping comment');
-            return;
-          }
-
-          const metricsPath = path.join(runs[0], 'metrics.json');
-          if (!fs.existsSync(metricsPath)) {
-            console.log('No metrics found, skipping comment');
-            return;
-          }
-
-          const metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
-          const analysisPath = path.join(runs[0], 'analysis.json');
-
-          const fmt = (val) => val == null ? 'N/A' : typeof val === 'number' ? val.toFixed(2) : String(val);
-
-          const rps = fmt(metrics.rps);
-          const avgMs = fmt(metrics.avg_ms);
-          const p95Ms = fmt(metrics.p95_ms);
-          const errorRate = fmt(metrics.error_rate);
-          const requests = metrics.requests || 'N/A';
-
-          let statusEmoji = '';
-          let statusText = 'Unknown';
-
-          if (fs.existsSync(analysisPath)) {
-            const analysis = JSON.parse(fs.readFileSync(analysisPath, 'utf8'));
-            const status = analysis.status || 'UNKNOWN';
-            if (status === 'PASS') {
-              statusEmoji = 'PASS';
-              statusText = 'Passed';
-            } else if (status === 'WARNING') {
-              statusEmoji = 'WARNING';
-              statusText = 'Warning';
-            } else if (status === 'DEGRADATION') {
-              statusEmoji = 'FAIL';
-              statusText = 'Degradation';
-            } else {
-              statusText = status;
-            }
-          } else {
-            const errRate = parseFloat(metrics.error_rate) || 0;
-            if (errRate < 5) {
-              statusEmoji = 'PASS';
-              statusText = 'Passed';
-            } else {
-              statusEmoji = 'FAIL';
-              statusText = 'Failed';
-            }
-          }
-
-          // A verdict without the number it was compared against is not a
-          // verdict: "P95 220 ms" reads as fine until you know the previous
-          // run did it in 120. So the table carries baseline, current and the
-          // delta, taken from the analysis where it exists.
-          const analysis = fs.existsSync(analysisPath)
-            ? JSON.parse(fs.readFileSync(analysisPath, 'utf8'))
-            : {};
-          const results = Array.isArray(analysis.results) ? analysis.results : [];
-          const byMetric = {};
-          for (const res of results) {
-            if (res && res.mode !== 'gate' && res.metric && byMetric[res.metric] === undefined) {
-              byMetric[res.metric] = res;
-            }
-          }
-
-          // Не на каждую метрику есть правило, а показать «было» хочется для
-          // всех — baseline лежит рядом в том же артефакте.
-          let baselineMetrics = {};
-          if (analysis.baseline_id) {
-            const baselinePath = path.join(artifactsDir, analysis.baseline_id, 'metrics.json');
-            if (fs.existsSync(baselinePath)) {
-              try {
-                baselineMetrics = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
-              } catch (err) {
-                console.log(`Could not read baseline metrics: ${err.message}`);
-              }
-            }
-          }
-
-          const unit = {rps: '', avg_ms: ' ms', p95_ms: ' ms', p99_ms: ' ms', error_rate: '%'};
-          const label = {
-            rps: 'RPS', avg_ms: 'Avg Response', p95_ms: 'P95 Response',
-            p99_ms: 'P99 Response', error_rate: 'Error Rate', requests: 'Total Requests',
-          };
-          const cell = (val, metric) => val == null ? '—' : `${fmt(val)}${unit[metric] || ''}`;
-          const delta = (res, base, current) => {
-            let percent = res && res.delta_percent != null ? res.delta_percent : null;
-            if (percent == null && typeof base === 'number' && typeof current === 'number' && base !== 0) {
-              percent = (current - base) / base * 100;
-            }
-            if (percent == null) return '—';
-            const text = `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`;
-            // Жирным — только то, по чему вынесен вердикт, остальное справочно.
-            const flagged = res && res.status !== 'PASS' && res.status !== 'SKIP';
-            return flagged ? `**${text}**` : text;
-          };
-
-          const rows = [];
-          for (const metric of ['p95_ms', 'avg_ms', 'rps', 'error_rate']) {
-            const res = byMetric[metric];
-            const current = metrics[metric];
-            const base = res && res.baseline != null ? res.baseline : baselineMetrics[metric];
-            if (current == null && base == null) continue;
-            rows.push(`| ${label[metric]} | ${cell(base, metric)} `
-                      + `| ${cell(current, metric)} | ${delta(res, base, current)} |`);
-          }
-          const baseRequests = baselineMetrics.requests == null ? '—' : baselineMetrics.requests;
-          rows.push(`| ${label.requests} | ${baseRequests} | ${requests} | — |`);
-
-          // Что именно не прошло — иначе статус приходится выводить из таблицы.
-          const failed = results
-            .filter(res => res && (res.status === 'DEGRADATION' || res.status === 'WARNING'))
-            .map(res => {
-              const name = res.metric;
-              if (res.delta_percent != null) {
-                const sign = res.delta_percent > 0 ? '+' : '';
-                return `${name} ${sign}${res.delta_percent.toFixed(1)}% vs baseline`
-                       + (res.fail != null ? ` (fails at ${res.fail}%)` : '');
-              }
-              return `${name} ${fmt(res.current)}`
-                     + (res.fail != null ? ` (fails at ${res.fail})` : '');
-            });
-
-          const runId = process.env.GITHUB_RUN_ID || '';
-          const repoUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}`;
-          const runUrl = `${repoUrl}/actions/runs/${runId}`;
-
-          // Ссылка на прогон ведёт на сводку — её можно читать глазами.
-          // Отдельно даём прямую ссылку на скачивание архива с HTML-отчётом:
-          // её адрес требует идентификатора артефакта, а он есть только в API.
-          const links = [`[Full breakdown on the run page](${runUrl})`];
-          try {
-            const {data} = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: Number(runId),
-            });
-            const artifact = (data.artifacts || [])
-              .filter(item => !item.expired)
-              .find(item => item.name.startsWith('${{ inputs.results_artifact }}'));
-            if (artifact) {
-              links.push(`[Download the HTML report](${runUrl}/artifacts/${artifact.id})`);
-            }
-          } catch (err) {
-            console.log(`Could not resolve the results artifact: ${err.message}`);
-          }
-
-          // Прогон без baseline — это не «всё хорошо», это «сравнить было не с
-          // чем». Молча показать зелёный статус здесь опаснее, чем показать
-          // красный: регрессия просто проходит мимо.
-          const noBaseline = !analysis.baseline_id;
-          const heading = noBaseline
-            ? `## Load Test Results — ${statusText}, but nothing to compare against`
-            : `## Load Test Results — ${statusText}`;
-          const baselineNote = noBaseline
-            ? ['> **No baseline was used**, so regression rules were skipped and only the '
-               + 'absolute thresholds ran. A slowdown against the previous run would not have '
-               + 'been caught. On a first run this is expected; otherwise the baseline artifact '
-               + 'is missing, expired, or its download failed — the run log says which.', '']
-            : [`Compared against \`${analysis.baseline_id}\`.`, ''];
-
-          const body = [
-            heading,
-            '',
-            '| Metric | Baseline | Current | Change |',
-            '|--------|---------:|--------:|-------:|',
-            ...rows,
-            '',
-            ...(failed.length ? [`**What tripped:** ${failed.join('; ')}`, ''] : []),
-            ...baselineNote,
-            links.join(' · ')
-          ].join('\n');
-
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: body
-          });
+      if: always() && inputs.post_pr_comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      continue-on-error: true
+      shell: bash
+      env:
+        SUMMARY: ${{ steps.run.outputs.summary_path }}
+        ARTIFACT_URL: ${{ steps.results.outputs.artifact-url }}
+        GITHUB_TOKEN: ${{ inputs.github_token || github.token }}
+      run: |
+        if [ -z "$SUMMARY" ] || [ ! -f "$SUMMARY" ]; then
+          echo "No summary was written; skipping the comment"
+          exit 0
+        fi
+        body="$RUNNER_TEMP/locomotive/comment.md"
+        cp "$SUMMARY" "$body"
+        if [ -n "$ARTIFACT_URL" ]; then
+          printf '\n[Download the HTML report](%s)\n' "$ARTIFACT_URL" >> "$body"
+        fi
+        loco comment --body "$body"

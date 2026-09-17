@@ -162,7 +162,6 @@ def generate_template(
         "scenario": scenario,
         "artifacts": {
             "storage": "artifacts",
-            "run_id": "${GITHUB_SHA:-local}",
             "history": 30,
             "_comment_history": "Number of recent runs to keep in history.json for trend charts (0 = disabled)",
         },
@@ -225,15 +224,71 @@ def generate_rules_template(output_path: Path) -> None:
     output_path.write_text(json.dumps(rules, indent=2), encoding="utf-8")
 
 
+def generate_jenkinsfile(
+    output_path: Path,
+    config_name: str = "loconfig.json",
+    version: Optional[str] = None,
+) -> None:
+    """Generate a Jenkinsfile that runs the load test with the shared library.
+
+    The library tag and the CLI it installs are both pinned to the Locomotive
+    release that wrote the file: the step passes flags that only exist from
+    that release on. The library is loaded without an administrator.
+    """
+    from . import __version__
+
+    release = version or __version__
+    jenkinsfile = f"""// Load test with Locomotive.
+// Options: https://github.com/locomotive-lib/locomotive/blob/master/jenkins/README.md
+library identifier: 'locomotive@v{release}',
+        retriever: modernSCM(
+            scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
+            libraryPath: 'jenkins/')
+
+pipeline {{
+    agent any
+
+    options {{
+        // Lets pull request builds copy the baseline from their target branch.
+        // Replace my-app with this multibranch project's full name.
+        copyArtifactPermission('my-app/*')
+    }}
+
+    stages {{
+        // TODO: start the service under test before this stage.
+
+        stage('Load test') {{
+            steps {{
+                // Add commentCredentialsId: '<Secret text credential id>' to
+                // comment on pull requests.
+                locomotiveLoadTest(config: '{config_name}', locomotiveVersion: '{release}')
+            }}
+        }}
+    }}
+}}
+"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(jenkinsfile, encoding="utf-8")
+
+
 def generate_github_workflow(output_path: Path, config_name: str = "loconfig.json") -> None:
-    """Generate a GitHub Actions workflow template."""
+    """Generate a GitHub Actions workflow template.
+
+    It uses the built-in action rather than calling ``loco`` directly: the
+    baseline has to travel from one workflow run to the next as an artifact,
+    and a workflow that only runs ``loco ci`` never has one to compare with.
+    """
     workflow = f'''name: Load Test
 
 on:
   push:
     branches: [main, master]
   pull_request:
-    branches: [main, master]
+
+permissions:
+  contents: read
+  actions: read          # find the baseline artifact from earlier runs
+  pull-requests: write   # post the results comment and keep it updated
 
 jobs:
   loadtest:
@@ -245,34 +300,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Install dependencies
-        run: |
-          pip install locomotive locust
-
-      # TODO: Add step to start your service here
+      # TODO: start the service under test here, e.g.
       # - name: Start service
-      #   run: docker-compose up -d
+      #   run: docker compose up -d
 
       - name: Run load test
-        run: loco --config {config_name} ci
-        env:
-          # Add your environment variables here
-          # API_TOKEN: ${{{{ secrets.API_TOKEN }}}}
-          DUMMY_SERVICE_URL: http://localhost:8000
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        if: always()
+        uses: locomotive-lib/locomotive/.github/actions/loadtest@master
         with:
-          name: loadtest-results
-          path: artifacts/
-
-      # Set baseline on push (each branch listed in push.branches maintains its own baseline)
-      - name: Set baseline
-        if: github.event_name == 'push'
-        run: loco --config {config_name} ci --set-baseline
+          config: {config_name}
+        # env:
+        #   API_TOKEN: ${{{{ secrets.API_TOKEN }}}}
 '''
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
