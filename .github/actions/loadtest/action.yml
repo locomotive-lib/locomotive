@@ -124,7 +124,7 @@ runs:
         echo "Baseline branch: $BASELINE_BRANCH (fallback: $FALLBACK_BRANCH)"
 
     - name: Download baseline (branch)
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -154,7 +154,7 @@ runs:
     # и прогон рапортует PASS, ничего ни с чем не сравнив.
     - name: Retry baseline download (branch)
       if: steps.check-baseline.outputs.found != 'true'
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -180,7 +180,7 @@ runs:
 
     - name: Download baseline (fallback)
       if: steps.check-baseline-retry.outputs.found != 'true' && steps.branch.outputs.baseline != steps.branch.outputs.fallback
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v24
       continue-on-error: true
       with:
         github_token: ${{ inputs.github_token || github.token }}
@@ -274,7 +274,7 @@ runs:
     - name: Upload results
       id: results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.results_artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: loadtest-artifacts/
@@ -283,7 +283,7 @@ runs:
 
     - name: Upload baseline
       if: inputs.set_baseline == 'true' && always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.baseline_artifact }}
         path: loadtest-artifacts/
