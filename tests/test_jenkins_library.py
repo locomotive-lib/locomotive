@@ -136,6 +136,18 @@ def test_warnings_exit_3_and_turn_the_build_unstable():
     assert "env.LOCO_EXIT_CODE == '3'" in example
 
 
+def test_the_virtualenv_goes_on_path():
+    # loco starts `locust` by name from the same virtualenv. Calling loco by
+    # its full path instead ended the run with "file not found: locust".
+    step = code_only(STEP.read_text(encoding="utf-8"))
+    assert "PATH+LOCO=" in step
+    assert "/bin/loco" not in step
+
+    example = code_only((ROOT / "jenkins" / "examples" / "Jenkinsfile.without-library").read_text(encoding="utf-8"))
+    assert "export PATH=" in example
+    assert ".loco-venv/bin/loco" not in example
+
+
 def test_version_flag(capsys):
     # The step logs `loco --version` so a build shows which CLI judged it.
     with pytest.raises(SystemExit) as exit_info:

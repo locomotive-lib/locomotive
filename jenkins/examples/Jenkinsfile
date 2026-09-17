@@ -2,7 +2,7 @@
 //
 // The library is loaded straight from GitHub, so no Jenkins administrator is
 // needed. Pin the tag to the Locomotive version you use.
-library identifier: 'locomotive@v0.3.0',
+library identifier: 'locomotive@v0.3.1',
         retriever: modernSCM(
             scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
             libraryPath: 'jenkins/')

@@ -1066,7 +1066,7 @@ runs for the next build, publishes JUnit results and the HTML report, turns
 pull/merge requests. Only branch builds record a baseline.
 
 ```groovy
-library identifier: 'locomotive@v0.3.0',
+library identifier: 'locomotive@v0.3.1',
         retriever: modernSCM(
             scm: [$class: 'GitSCMSource', remote: 'https://github.com/locomotive-lib/locomotive.git'],
             libraryPath: 'jenkins/')

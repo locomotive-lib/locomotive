@@ -40,8 +40,10 @@ def call(Map config = [:]) {
              baselineHint()
     }
 
-    String loco = resolveLoco(opts)
-    sh "${loco} --version"
+    // Whatever virtualenv loco lives in goes on PATH: loco starts `locust` by
+    // name, and locust sits in that same virtualenv. Calling loco by its full
+    // path instead left the run with "file not found: locust".
+    List locoEnv = resolveLocoEnv(opts)
 
     List args = ['--config', opts.config, 'ci',
                  '--storage', storage, '--prune',
@@ -65,14 +67,16 @@ def call(Map config = [:]) {
     }
 
     int code = 1
-    try {
-        code = sh(script: "${loco} ${quoteAll(args)}", returnStatus: true)
-    } finally {
-        publishResults(opts)
-    }
-
-    if (changeRequest && opts.comment) {
-        postComment(opts, loco)
+    withEnv(locoEnv) {
+        sh 'loco --version'
+        try {
+            code = sh(script: "loco ${quoteAll(args)}", returnStatus: true)
+        } finally {
+            publishResults(opts)
+        }
+        if (changeRequest && opts.comment) {
+            postComment(opts)
+        }
     }
     return verdict(opts, code)
 }
@@ -174,7 +178,7 @@ String baselineHint() {
 // step passes arrived with it, and an older `loco` fails on them with nothing
 // but a usage message. A `loco` already on the agent is used only when it is
 // that version; otherwise that version is installed into the workspace.
-String resolveLoco(Map opts) {
+List resolveLocoEnv(Map opts) {
     String wanted = opts.locomotiveVersion ? opts.locomotiveVersion.toString() : libraryVersion()
     boolean onPath = sh(script: 'command -v loco >/dev/null 2>&1', returnStatus: true) == 0
     String found = onPath ? sh(script: 'loco --version 2>/dev/null || true', returnStdout: true).trim() : ''
@@ -187,13 +191,13 @@ String resolveLoco(Map opts) {
         if (!matches) {
             echo "WARNING: this step is written for locomotive ${wanted}; the agent has ${found ?: 'an older loco'}"
         }
-        return 'loco'
+        return []
     }
     if (opts.install == 'auto' && matches) {
-        return 'loco'
+        return []
     }
     if (onPath && !matches) {
-        echo "The agent's loco (${found ?: 'older than 0.3.0'}) is not locomotive ${wanted}: installing ${wanted} into .loco-venv"
+        echo "The agent's loco (${found ?: 'an older release'}) is not locomotive ${wanted}: installing ${wanted} into .loco-venv"
     }
     String venv = "${env.WORKSPACE}/.loco-venv"
     sh """
@@ -202,12 +206,13 @@ String resolveLoco(Map opts) {
         ${quote(venv + '/bin/python')} -m pip install --quiet --upgrade pip
         ${quote(venv + '/bin/python')} -m pip install --quiet ${quote('locomotive==' + wanted)}
     """
-    return quote(venv + '/bin/loco')
+    // PATH, not the full path to the binary: locust has to be found too.
+    return ["PATH+LOCO=${venv}/bin"]
 }
 
 String libraryVersion() {
     // Kept equal to locomotive/__init__.py by tests/test_jenkins_library.py.
-    return '0.3.0'
+    return '0.3.1'
 }
 
 def publishResults(Map opts) {
@@ -237,7 +242,7 @@ def publishResults(Map opts) {
     }
 }
 
-def postComment(Map opts, String loco) {
+def postComment(Map opts) {
     String summary = "${opts.resultsDir}/summary.md"
     if (!fileExists(summary)) {
         echo 'No summary was written, so there is nothing to comment.'
@@ -250,7 +255,7 @@ def postComment(Map opts, String loco) {
     }
     int status = 1
     withCredentials([string(credentialsId: opts.commentCredentialsId, variable: 'LOCO_COMMENT_TOKEN')]) {
-        status = sh(script: "${loco} comment --body ${quote(summary)} --token-env LOCO_COMMENT_TOKEN",
+        status = sh(script: "loco comment --body ${quote(summary)} --token-env LOCO_COMMENT_TOKEN",
                     returnStatus: true)
     }
     if (status != 0) {
