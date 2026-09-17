@@ -8,6 +8,7 @@ exit code 1 — with the full traceback still one flag away.
 """
 
 import json
+import re
 
 import pytest
 
@@ -46,14 +47,22 @@ class TestMalformedConfig:
         assert "Traceback" not in err
 
     def test_bad_json_names_the_line_and_column(self, tmp_path, capsys):
-        path = _write(tmp_path, "bad.json", '{\n"target": {"host": "http://x"},\n}\n')
+        text = '{\n"target": {"host": "http://x"},\n}\n'
+        path = _write(tmp_path, "bad.json", text)
 
         code = main(["--config", path, "validate"])
 
         err = capsys.readouterr().err
         assert code == 1
         assert "could not parse JSON" in err
-        assert "line 3" in err
+        # Where the parser points depends on the Python: 3.13 names the
+        # trailing comma, older versions the brace after it. Either is a place
+        # the reader can go and fix, so the position is held to one of those
+        # two characters rather than to one version's line number.
+        match = re.search(r"\(line (\d+), column (\d+)\)", err)
+        assert match, err
+        line, column = int(match.group(1)), int(match.group(2))
+        assert text.splitlines()[line - 1][column - 1] in (",", "}")
         assert "Traceback" not in err
 
     def test_top_level_list_says_so(self, tmp_path, capsys):

@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -618,11 +619,17 @@ class TestParseErrors:
         assert "could not parse YAML" in message
 
     def test_json_error_carries_line_and_column(self, tmp_path):
+        text = '{\n  "load": {},\n}\n'
         with pytest.raises(ValueError) as excinfo:
-            self._load(tmp_path, "bad.json", '{\n  "load": {},\n}\n')
+            self._load(tmp_path, "bad.json", text)
         message = str(excinfo.value)
         assert "could not parse JSON" in message
-        assert "line 3" in message
+        # 3.13 points at the trailing comma, earlier Pythons at the brace
+        # after it; the reported position must land on one of the two.
+        match = re.search(r"\(line (\d+), column (\d+)\)", message)
+        assert match, message
+        line, column = int(match.group(1)), int(match.group(2))
+        assert text.splitlines()[line - 1][column - 1] in (",", "}")
         assert "bad.json" in message
 
     def test_top_level_list_is_rejected(self, tmp_path):
